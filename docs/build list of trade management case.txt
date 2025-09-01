@@ -1,0 +1,36 @@
+build list of trade management case
+
+Initiated by ME
+
+leg 1 pending 
+leg 2-4 pedning
+
+-> price passes Tp1. delete orders
+
+leg 1 opened and hit TP1 no closed
+leg 2-4 pedning
+-> I think the pendings are still valid until TP2 passed?
+
+
+Initieated by Signals
+
+Message based
+I'm going risk free @
+.. other vairations
+
+
+
+!!! IMPORTANT INFORMATION !!!
+
+Over the past couple of days, we’ve noticed a few little hiccups in our trade calls. The reason is the market’s been moving so rapidly and aggressively that, in our rush to get you the information as fast as possible, the occasional typo or number slip sneaks through.
+
+Think of it as us trying to hand you the winning lottery ticket while sprinting. Sometimes, the handwriting suffers. So, here’s the standardized info you can always rely on: if we share a trade with a take-profit level attached, that’s because it’s a shorter target and it will be the TP1 you should look for. If we don’t specify, or you spot an error, our default model is:
+
+TP1: 30 pips
+TP2: 70 pips
+TP3: 120 pips
+SL: 50 pips (sometimes a bit bigger or smaller depending on market conditions)
+
+If there’s a mistake, just use these numbers and carry on. we usually catch and correct any issues long before you’ve had to worry about them anyway.
+
+Thank you for your understanding.

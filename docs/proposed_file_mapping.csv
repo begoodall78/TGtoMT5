@@ -1,0 +1,41 @@
+source,dest
+.env,.env
+app/__init__.py,app/__init__.py
+app/cli/__init__.py,app/__init__.py
+app/domain/__init__.py,app/__init__.py
+app/infra/__init__.py,app/__init__.py
+app/services/__init__.py,app/__init__.py
+app/infra/logging_config.py,app/common/logging_config.py
+app/infra/unparsed_reporter.py,app/domain/unparsed_reporter.py
+app/services/actions_runner.py,app/infra/actions_runner.py
+app/infra/mt5_router.py,app/infra/mt5_router.py
+app/cli/mt5_tools.py,app/infra/mt5_tools.py
+app/domain/router.py,app/infra/router.py
+app/infra/telegram_queue - Copy.py,app/infra/telegram_queue - Copy.py
+app/infra/telegram_queue.py,app/infra/telegram_queue.py
+app/cli/main.py,app/main.py
+app/domain/models.py,app/models.py
+app/services/orchestrator.py,app/orchestrator.py
+app/cli/preview.py,app/preview.py
+app/domain/processing.py,app/processing.py
+app/infra/storage.py,app/storage.py
+app/infra/symbol_map.py,app/symbol_map.py
+app/test.py,app/test.py
+tg_list_channels.py,app/tg_list_channels.py
+.dev notes.txt,docs/.dev notes.txt
+README.txt,docs/README.txt
+build list of trade management case.txt,docs/build list of trade management case.txt
+actions_inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_1.csv,runtime/actions/inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_1.csv
+actions_inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_2.csv,runtime/actions/inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_2.csv
+actions_inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_3.csv,runtime/actions/inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_3.csv
+actions_inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_4.csv,runtime/actions/inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_4.csv
+actions_inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_5.csv,runtime/actions/inbox/OPEN-20250815-085752-d75afe8d8d_OPEN_975_5.csv
+data/app.db,runtime/data/app.db
+.sessions/tg.session,runtime/sessions/tg.session
+tg.session,runtime/sessions/tg.session
+diag__signal_preview.bat,scripts/diag__signal_preview.bat
+diag_dbcheck.bat,scripts/diag_dbcheck.bat
+diag_mt5check.bat,scripts/diag_mt5check.bat
+diag_smoke.bat,scripts/diag_smoke.bat
+start_listener.bat,scripts/start_listener.bat
+start_runner.bat,scripts/start_runner.bat

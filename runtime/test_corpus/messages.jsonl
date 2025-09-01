@@ -1,0 +1,23 @@
+{"chat": "test", "id": 1001, "text": "SELL @ 3344/3349"}
+{"chat": "test", "id": 1002, "text": "BUY @ 3332"}
+{"chat": "test", "id": 1003, "text": "sell @3331/3324"}
+{"chat": "test", "id": 1004, "text": "Buy @ 3330"}
+{"chat": "test", "id": 1011, "text": "SELL @ 3344/3349\n\nTP 3341\nTP 3337\nTP 3332\nTP OPEN\nSL 3350"}
+{"chat": "test", "id": 1012, "text": "BUY @ 3332/3325\nTP 3357\nTP 3361\nTP 3366\nTP OPEN\nSL 3349"}
+{"chat": "test", "id": 1013, "text": "BUY @ 3332\nTP OPEN\nSL 3349"}
+{"chat": "test", "id": 1014, "text": "SELL @ 3340\nTP 3330\nSL 3355"}
+{"chat": "test", "id": 1021, "text": "Set trades on KAM_PRE#1 to break even"}
+{"chat": "test", "id": 1022, "text": "Moving stops on KAM_PRE#3 to 3355"}
+{"chat": "test", "id": 1023, "text": "Go risk free on KAM_PRE#2"}
+{"chat": "test", "id": 1024, "text": "Move SL to 3348 on KAM_PRE#4"}
+{"chat": "test", "id": 1031, "text": "\"SELL @ 3344/3349\"\nSet to break even"}
+{"chat": "test", "id": 1032, "text": "\"BUY @ 3332\"\nMove SL to 3340"}
+{"chat": "test", "id": 1033, "text": "\"BUY @ 3332/3325\"\nGo risk free"}
+{"chat": "test", "id": 1041, "text": "Executed, thanks"}
+{"chat": "test", "id": 1042, "text": "Screenshot attached"}
+{"chat": "test", "id": 1043, "text": "Filled"}
+{"chat": "test", "id": 1044, "text": "done"}
+{"chat": "test", "id": 1045, "text": "OPENED at market"}
+{"chat": "test", "id": 1051, "text": "SELL @ 3344/3349\nTP 3341\nTP 3337\nsl 3350"}
+{"chat": "test", "id": 1052, "text": "buy @3332 tp open"}
+{"id": "t_tp2_01", "text": "TP2 HIT", "quoted_msg_id": "1001", "expected_intent": "MGMT_TP2_HIT"}

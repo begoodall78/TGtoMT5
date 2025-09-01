@@ -1,0 +1,270 @@
+# ===============================================================
+# TGtoMT5 Parser — Semantic Rules
+# Cleaned and documented inline (non-breaking)
+# Date: 2025-08-19
+# Notes:
+# - This file is the ONLY runtime source of truth for message parsing.
+# - We added comments ONLY. No keys/values were changed.
+# - Rule IDs were kept EXACTLY the same to avoid code changes.
+# - Order preserved. Priorities unchanged.
+# ===============================================================
+
+dictionary_version: 2025-08-18.semantic-v1+phase2to4+require_quote_mgmt+tp2cancel
+
+defaults:
+  legs: 8
+  leg_volume: 0.01
+  require_symbol: false
+  require_price: true
+
+rules:
+# ---------------------------------------------------------------
+# RULE: open_strict_v1
+# Intent: OPEN — complete entry with side, entry, SL, and ≥1 TP.
+# Matches: single price (e.g., 'BUY @ 3342') OR a price band (e.g., 'SELL @ 3344/3349').
+# Requires: side, entry, sl, tps (as per when_all conditions).
+# Outputs (map): fields used by engine to create an OPEN action (side, entry, sl, tps, etc).
+# Target resolution: n/a (OPEN).
+# Examples (format only; not parsed from comments):
+#   BUY @ 3342
+#   TP 3346
+#   TP 3350
+#   TP 3355
+#   TP OPEN
+#   SL 3333
+  - id: open_strict_v1
+    intent: OPEN
+    priority: 100
+    when_all:
+      - field: side
+        is_in: [BUY, SELL]
+      - field: entry.exists
+        eq: true
+      - field: sl
+        exists: true
+      - field: tps.length
+        gte: 1
+    map:
+      symbol: symbol
+      legs: defaults.legs
+      leg_volume: defaults.leg_volume
+      entry: entry
+      sl: sl
+      tps: tps
+
+# ---------------------------------------------------------------
+# RULE: open_partial_band_v1
+# Intent: OPEN — partial/fast entry when side + entry band is present.
+# Matches: price band (two prices like "3344/3349").
+# Requires: side, entry.band; forbids SL and TPs (keeps this "partial").
+# Outputs: opens all default legs spread across the band.
+# Examples:
+#   SELL @ 3344/3349
+# band partial (no SL/TPs) — open all default legs
+  - id: open_partial_band_v1
+    intent: OPEN
+    priority: 81
+    when_all:
+      - field: side
+        is_in: [BUY, SELL]
+      - field: entry.exists
+        eq: true
+      - field: entry.band
+        exists: true
+      - field: sl
+        not_exists: true
+      - field: tps.length
+        eq: 0
+    map:
+      symbol: symbol
+      legs: defaults.legs
+      leg_volume: defaults.leg_volume
+      entry: entry
+# ---------------------------------------------------------------
+# RULE: open_partial_single_v1
+# Intent: OPEN — partial/fast entry when side + single entry price is present.
+# Matches: single price only (no band).
+# Requires: side, entry.value; forbids SL and TPs (keeps this "partial").
+# Outputs: opens only 1 leg at that price; further legs added later when more info arrives.
+# Examples:
+#   BUY @ 3353
+# single with no SL/TPs — last resort, open 1 leg only
+  - id: open_partial_single_v1
+    intent: OPEN
+    priority: 80
+    when_all:
+      - field: side
+        is_in: [BUY, SELL]
+      - field: entry.exists
+        eq: true
+      - field: entry.value
+        exists: true
+      - field: entry.band
+        not_exists: true
+      - field: sl
+        not_exists: true
+      - field: tps.length
+        eq: 0
+    map:
+      symbol: symbol
+      legs: 1
+      leg_volume: defaults.leg_volume
+      entry: entry
+
+# ---------------------------------------------------------------
+# RULE: open_single_strict_v1
+# Intent: OPEN — single-price "strict" (entry + SL + ≥1 TP) but open only 1 leg.
+# Why: Some scalps are full-detail single-price entries; we still want just one leg.
+# Priority: Above open_strict_v1 so it wins for single-price strict cases.
+# Examples:
+#   BUY @ 3341 TP 3345 SL 3339
+#   BUY @ 3341 SL 3339 TP 3345
+# strict single: both SL and ≥1 TP — open 1 leg
+  - id: open_single_strict_v1
+    intent: OPEN
+    priority: 101
+    when_all:
+      - field: side
+        is_in: [BUY, SELL]
+      - field: entry.exists
+        eq: true
+      - field: entry.value
+        exists: true
+      - field: entry.band
+        not_exists: true
+      - field: sl
+        exists: true
+      - field: tps.length
+        gte: 1
+    map:
+      symbol: symbol
+      legs: 1
+      leg_volume: defaults.leg_volume
+      entry: entry
+      sl: sl
+      tps: tps
+# ---------------------------------------------------------------
+# RULE: open_partial_single_with_tps_v1
+# Intent: OPEN — single-price partial with ≥1 TP but no SL; open only 1 leg.
+# Covers: "BUY @ 3336 TP 3338"
+# single with ≥1 TP but no SL — open 1 leg and pass TPs
+  - id: open_partial_single_with_tps_v1
+    intent: OPEN
+    priority: 86
+    when_all:
+      - field: side
+        is_in: [BUY, SELL]
+      - field: entry.exists
+        eq: true
+      - field: entry.value
+        exists: true
+      - field: entry.band
+        not_exists: true
+      - field: sl
+        not_exists: true
+      - field: tps.length
+        gte: 1
+    map:
+      symbol: symbol
+      legs: 1
+      leg_volume: defaults.leg_volume
+      entry: entry
+      tps: tps
+
+# ---------------------------------------------------------------
+# (Optional but handy)
+# RULE: open_partial_single_with_sl_v1
+# Intent: OPEN — single-price partial with SL but no TPs; open only 1 leg.
+# single with SL but no TPs — open 1 leg and pass SL
+  - id: open_partial_single_with_sl_v1
+    intent: OPEN
+    priority: 85
+    when_all:
+      - field: side
+        is_in: [BUY, SELL]
+      - field: entry.exists
+        eq: true
+      - field: entry.value
+        exists: true
+      - field: entry.band
+        not_exists: true
+      - field: sl
+        exists: true
+      - field: tps.length
+        eq: 0
+    map:
+      symbol: symbol
+      legs: 1
+      leg_volume: defaults.leg_volume
+      entry: entry
+      sl: sl
+
+
+
+# ---------------------------------------------------------------
+# RULE: mgmt_break_even_semantic_v1
+# Intent: MODIFY — move SL to entry (break-even).
+# Requires: quoted/replied original message for safe target resolution.
+# Resolution preference: by quote (meta.quoted_msg_id).
+# Synonyms captured: 'break even', 'risk free', 'breakeven', 'move to be/2 be', and a guarded single 'be'.
+# Outputs (map): adjust_sl_to: entry
+# Examples:
+#   (reply) 'move to BE'
+#   (reply) 'risk free'
+  - id: mgmt_break_even_semantic_v1
+    intent: MGMT_BREAK_EVEN
+    priority: 50
+    when_all:
+      - field: meta.quoted_msg_id
+        exists: true
+    when_any:
+      # Phrases that users actually write
+      - field: text.norm
+        contains_any:
+          - "break even"
+          - "risk free"
+          - "breakeven"
+          - "move to be"
+          - "move 2 be"
+      # Single-word BE (safe because we require a reply/quote)
+      - field: text.norm
+        contains_word_any: ["be"]
+    map:
+      adjust_sl_to: "entry"
+    target_resolution:
+      prefer:
+        - by_quote: meta.quoted_msg_id
+
+
+# ---------------------------------------------------------------
+# Management: TP2 HIT — cancel all remaining PENDING legs
+# Requires: quoted original entry message (safe GK resolution)
+# Intent: MGMT_TP2_HIT
+# Notes: does not close open positions; only removes pending orders.
+  - id: mgmt_tp2_hit_cancel_pendings_v1
+    intent: MGMT_TP2_HIT
+    priority: 50
+    when_all:
+      - field: meta.quoted_msg_id
+        exists: true
+    when_any:
+      - field: text.norm
+        contains_any:
+          - "tp2 hit"
+          - "tp 2 hit"
+    map: {}
+    target_resolution:
+      prefer:
+        - by_quote: meta.quoted_msg_id
+
+ignore_rules:
+  version: 2025-08-21
+  contains:
+    - OUT AT ENTRY
+    - TP1 HIT
+    - TP1 +
+    - TP3 HIT
+    - TP3 +
+    - SL HIT
+    - SL -
+    - USE LOW RISK
