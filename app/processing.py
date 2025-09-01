@@ -359,6 +359,17 @@ def _coalesce_modify_legs(legs: list[Leg], gk: str) -> list[Leg]:
 
 def _reason_for_unparsed(ps: ParseSignal, raw: str) -> str:
     """Derive a specific reason string for unparsed/ignored messages."""
+    
+    # Check for invalid range first (new check)
+    if ps.side and len(ps.entries or []) >= 2:
+        worst_price = ps.entries[0]
+        better_price = ps.entries[1]
+        
+        if ps.side == 'BUY' and worst_price <= better_price:
+            return 'INVALID_RANGE'
+        elif ps.side == 'SELL' and worst_price >= better_price:
+            return 'INVALID_RANGE'
+
     text = (raw or '').strip()
     try:
         side_present = bool(_SIDE_RE.search(text))
@@ -481,37 +492,92 @@ def semantic_route(ps: ParseSignal, text: str, reply_to_msg_id: Optional[str]):
     return {'kind': kind, 'intent': str(intent) if intent else None, 'rule_id': rule_id, 'ast': ast, 'ps': ps}
 
 
-def plan_legs(ps: ParseSignal, legs_count: int) -> tuple[list[Optional[float]], list[Optional[float]] , int]:
-    """Plan per-leg entries and TPs in one place. Returns (entries, tps, effective_legs)."""
-    # Decide leg count
+def plan_legs(ps: ParseSignal, legs_count: int) -> tuple[list[Optional[float]], list[Optional[float]], int]:
+    """Plan per-leg entries and TPs in one place. Returns (entries, tps, effective_legs).
+    
+    For single price: Creates 4 legs at that price
+    For dual price: Creates 16 legs distributed across 4 equidistant entry points
+    """
+    
+    # Single price: 4 legs only (unchanged)
     if len(ps.entries or []) == 1:
         effective = 4
-    elif len(ps.entries or []) >= 2:
-        effective = 8
-    else:
-        effective = legs_count
-
-    # Entries
-    entries: list[Optional[float]] = [None] * effective
-    if len(ps.entries or []) == 1:
         entries = [ps.entries[0]] * effective
+        
+    # Dual price: 16 legs across 4 entry points  
     elif len(ps.entries or []) >= 2:
-        a, b = ps.entries[0], ps.entries[1]
-        half = max(1, effective // 2)
-        for i in range(effective):
-            entries[i] = a if i < half else b
+        worst_price = ps.entries[0]   # First price is always worst
+        better_price = ps.entries[1]  # Second price is always better
+        
+        # Validate range based on direction
+        if ps.side == 'BUY':
+            if worst_price <= better_price:
+                # Invalid: for BUY, worst should be higher
+                raise ValueError(f"Invalid BUY range: {worst_price}/{better_price} - first price must be higher than second")
+        elif ps.side == 'SELL':
+            if worst_price >= better_price:
+                # Invalid: for SELL, worst should be lower
+                raise ValueError(f"Invalid SELL range: {worst_price}/{better_price} - first price must be lower than second")
+        # Note: If no side specified yet (shouldn't happen), we skip validation
+        
+        # Calculate 4 equidistant entry points
+        price_range = abs(better_price - worst_price)
+        step = price_range / 3  # 3 steps between 4 points
+        
+        # Generate entry points (worst to best order)
+        entry_points = []
+        for i in range(4):
+            if ps.side == 'BUY':
+                # BUY: worst (high) to best (low)
+                price = worst_price - (i * step)
+            elif ps.side == 'SELL':
+                # SELL: worst (low) to best (high)
+                price = worst_price + (i * step)
+            else:
+                # Fallback if no side (shouldn't happen in practice)
+                # Use ascending order as default
+                if worst_price < better_price:
+                    price = worst_price + (i * step)
+                else:
+                    price = worst_price - (i * step)
+            
+            # Round to 2 decimal places
+            entry_points.append(round(price, 2))
+        
+        # Create 16 legs: 4 per entry point (worst to best)
+        effective = 16
+        entries = []
+        for i in range(16):
+            entries.append(entry_points[i // 4])
+            
+    else:
+        # No entries specified - use default leg count
+        effective = legs_count
+        entries = [None] * effective
 
-    # TPs
+    # TPs distribution
     has_open = any((t is None for t in (ps.tps or [])))
     symbol_for_pips = (ps.symbol or DEFAULT_SYMBOL)
-    # For 8+ legs and distinct entries, duplicate a 4-TP block
-    if effective >= 8 and entries and (entries[0] is not None) and (len(entries) > 4) and (entries[4] is not None) and (not _is_same_price(entries[0], entries[4], symbol_for_pips)):
+    
+    # For 16 legs with distinct entries, repeat the 4-TP block pattern
+    if effective == 16 and entries and (entries[0] is not None):
+        blk = _tp_block_from_list(ps.tps or [], has_open)
+        # Repeat the block 4 times for 16 legs
+        tp_list = (blk * 4)[:effective]
+        
+    # For 8 legs - this shouldn't happen anymore with new logic, but keep for safety
+    elif effective == 8 and entries and (entries[0] is not None) and (len(entries) > 4) and (entries[4] is not None) and (not _is_same_price(entries[0], entries[4], symbol_for_pips)):
         blk = _tp_block_from_list(ps.tps or [], has_open)
         tp_list = (blk * ((effective + 3)//4))[:effective]
+        
+    # For 4 legs (single price)
     elif effective == 4:
         tp_list = _tp_block_from_list(ps.tps or [], has_open)
+        
+    # Fallback for other cases
     else:
         tp_list = _tps_for_legs(ps, effective)
+    
     return entries, tp_list, effective
 
 def build_open_action(ps: ParseSignal, source_msg_id: str, legs_count: int, leg_volume: float) -> Action:
@@ -675,6 +741,7 @@ def build_cancel_pending_action_from_gk(gk: str, ps: ParseSignal, source_msg_id:
     return act
 
 def build_modify_from_edit(ps: ParseSignal, source_msg_id: str, legs_count: int) -> Optional[Action]:
+    """Build MODIFY action when an OPEN message is edited, properly handling 16 legs."""
     gk = resolve_group_key(text=ps.raw, reply_to_msg_id=str(source_msg_id))
     log.info('OPEN_EDIT: GK=%s', gk)
     if not gk:
@@ -682,8 +749,10 @@ def build_modify_from_edit(ps: ParseSignal, source_msg_id: str, legs_count: int)
     legs_meta = list_open_legs(gk) or []
     if not legs_meta:
         return None
+    
     # Use the unified planner for consistency across OPEN and EDIT/MODIFY
     planned_entries, tp_list, planned_size = plan_legs(ps, legs_count)
+    
     def _resolve_symbol_for_pips(ps_):
         # 1) explicit single symbol parsed
         sym = getattr(ps_, "symbol", None)
@@ -699,39 +768,92 @@ def build_modify_from_edit(ps: ParseSignal, source_msg_id: str, legs_count: int)
             return meta.symbol
         # 4) final fallback
         return DEFAULT_SYMBOL
+    
     symbol_for_pips = _resolve_symbol_for_pips(ps)
-    if planned_size >= 8 and planned_entries and (planned_entries[0] is not None) and (planned_entries[4] is not None) and (not _is_same_price(planned_entries[0], planned_entries[4], symbol_for_pips)):
+    
+    # FIX: Handle 16 legs properly
+    if planned_size == 16 and planned_entries and (planned_entries[0] is not None):
+        # For 16 legs, repeat the TP block 4 times
         has_open = any((t is None for t in ps.tps or []))
         blk = _tp_block_from_list(ps.tps or [], has_open)
-        tp_list = blk + blk
-        while len(tp_list) < planned_size:
-            tp_list.append(blk[-1])
+        tp_list = (blk * 4)[:planned_size]  # Repeat block 4 times for 16 legs
+        
+    elif planned_size >= 8 and planned_entries and (planned_entries[0] is not None) and \
+         len(planned_entries) > 4 and (planned_entries[4] is not None) and \
+         (not _is_same_price(planned_entries[0], planned_entries[4], symbol_for_pips)):
+        # Legacy 8-leg handling (shouldn't happen with new logic, but keep for safety)
+        has_open = any((t is None for t in ps.tps or []))
+        blk = _tp_block_from_list(ps.tps or [], has_open)
+        tp_list = (blk * 2)[:planned_size]  # Repeat block 2 times for 8 legs
+        
     elif planned_size == 4:
         has_open = any((t is None for t in ps.tps or []))
         tp_list = _tp_block_from_list(ps.tps or [], has_open)
+        
     elif len(ps.entries or []) == 1:
         planned_entries = [ps.entries[0]] * 4
         tp_list = _tps_for_legs(ps, 4)
+        
     else:
         planned_entries = [m.get('entry') for m in legs_meta]
         tp_list = _tps_for_legs(ps, len(planned_entries))
+    
+    # Build legs
     legs: List[Leg] = []
     meta_symbol = legs_meta[0].get('symbol') if legs_meta and legs_meta[0].get('symbol') else ps.symbol or DEFAULT_SYMBOL
     client_id = _client_id_for_message(str(meta_symbol), source_msg_id)
+    
     for i, meta in enumerate(legs_meta, start=1):
         leg_id = _make_leg_id(client_id, i)
         tag = meta.get('leg_tag') or leg_id
         entry_i = planned_entries[i - 1] if i - 1 < len(planned_entries) else meta.get('entry')
         new_sl = ps.sl if ps.sl is not None else meta.get('sl')
         new_tp = tp_list[i - 1] if i - 1 < len(tp_list) else meta.get('tp')
-        legs.append(Leg(leg_id=leg_id, symbol=meta.get('symbol', meta_symbol), side=meta.get('side', ps.side), volume=float(meta.get('volume') or DEFAULT_LEG_VOLUME), entry=entry_i, sl=new_sl, tp=new_tp, tag=tag, position_ticket=meta.get('position_ticket'), order_ticket=meta.get('order_ticket')))
+        
+        legs.append(Leg(
+            leg_id=leg_id,
+            symbol=meta.get('symbol', meta_symbol),
+            side=meta.get('side', ps.side),
+            volume=float(meta.get('volume') or DEFAULT_LEG_VOLUME),
+            entry=entry_i,
+            sl=new_sl,
+            tp=new_tp,
+            tag=tag,
+            position_ticket=meta.get('position_ticket'),
+            order_ticket=meta.get('order_ticket')
+        ))
+        
+        # Log resolution for debugging
         resolved_by = 'position_ticket' if meta.get('position_ticket') else 'order_ticket' if meta.get('order_ticket') else 'tag'
-        logging.getLogger('processing').info('MGMT_RESOLVE', extra={'event': 'MGMT_RESOLVE', 'gk': gk, 'tag': tag, 'symbol': meta.get('symbol', meta_symbol), 'resolved_by': resolved_by, 'position_ticket': meta.get('position_ticket'), 'order_ticket': meta.get('order_ticket')})
+        logging.getLogger('processing').info(
+            'MGMT_RESOLVE',
+            extra={
+                'event': 'MGMT_RESOLVE',
+                'gk': gk,
+                'tag': tag,
+                'symbol': meta.get('symbol', meta_symbol),
+                'resolved_by': resolved_by,
+                'position_ticket': meta.get('position_ticket'),
+                'order_ticket': meta.get('order_ticket')
+            }
+        )
+    
+    # Handle case where new entries are added (shouldn't happen in normal edit)
     if len(planned_entries) > len(legs_meta):
         for j in range(len(legs_meta) + 1, len(planned_entries) + 1):
             tag_new = f'{meta_symbol or DEFAULT_SYMBOL}#{j}'
-            leg_new = Leg(leg_id=_make_leg_id(client_id, j), symbol=str(meta_symbol), side=ps.side, volume=float(DEFAULT_LEG_VOLUME), entry=planned_entries[j - 1], sl=ps.sl, tp=tp_list[j - 1] if j - 1 < len(tp_list) else None, tag=tag_new)
+            leg_new = Leg(
+                leg_id=_make_leg_id(client_id, j),
+                symbol=str(meta_symbol),
+                side=ps.side,
+                volume=float(DEFAULT_LEG_VOLUME),
+                entry=planned_entries[j - 1],
+                sl=ps.sl,
+                tp=tp_list[j - 1] if j - 1 < len(tp_list) else None,
+                tag=tag_new
+            )
             legs.append(leg_new)
+    
     legs = _coalesce_modify_legs(legs, gk)
     action_id = _make_action_id('MODIFY', source_msg_id, legs)
     return Action(action_id=action_id, type='MODIFY', legs=legs, source_msg_id=str(source_msg_id))
@@ -774,6 +896,36 @@ def build_actions_from_message(source_msg_id: str, text: str, *, is_edit: bool=F
     legs_count = max(1, min(int(legs_count), MAX_LEGS))
     ps = parse_signal_text(text)
     route = semantic_route(ps, text, reply_to_msg_id)
+
+    # Validate range early for dual-price entries
+    if ps.side and len(ps.entries or []) >= 2:
+        worst_price = ps.entries[0]
+        better_price = ps.entries[1]
+        
+        # Check for invalid range based on direction
+        is_invalid_range = False
+        error_msg = ""
+        
+        if ps.side == 'BUY' and worst_price <= better_price:
+            is_invalid_range = True
+            error_msg = f"Invalid BUY range: {worst_price}/{better_price} - first price must be higher than second"
+        elif ps.side == 'SELL' and worst_price >= better_price:
+            is_invalid_range = True
+            error_msg = f"Invalid SELL range: {worst_price}/{better_price} - first price must be lower than second"
+        
+        if is_invalid_range:
+            log.warning("INVALID_RANGE: %s", error_msg)
+            if ENGINE_FAILSAFE_ON_UNPARSED:
+                _report_unparsed(
+                    unparsed_reporter, 
+                    unparsed_raw_msg, 
+                    reason='INVALID_RANGE', 
+                    source_msg_id=source_msg_id, 
+                    symbol_guess=ps.symbol or DEFAULT_SYMBOL, 
+                    side_guess=ps.side
+                )
+            return []
+
     if route['kind'] != 'MGMT':
         has_side = bool(_SIDE_RE.search(text or ''))
         has_at = '@' in (text or '')

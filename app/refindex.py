@@ -157,7 +157,10 @@ def generate_mock_ack_for_open(action: Dict[str, Any]) -> str:
         w.writerows(rows)
     return str(out_path)
 
+# Alternative fix for app/refindex.py - sort in Python instead
+
 def list_open_legs(group_key: str) -> List[Dict[str, Any]]:
+    """List all legs for a group, properly sorted by leg number."""
     _ensure_db()
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
@@ -169,16 +172,28 @@ def list_open_legs(group_key: str) -> List[Dict[str, Any]]:
                    entry,
                    sl,
                    tp,
-                   ticket,                 -- legacy field
-                   order_ticket,           -- NEW
-                   position_ticket,        -- NEW
+                   ticket,
+                   order_ticket,
+                   position_ticket,
                    status
               FROM legs_index
              WHERE group_key=?
-             ORDER BY leg_tag
         """, (group_key,))
-        return [dict(r) for r in cur.fetchall()]
-
+        
+        rows = [dict(r) for r in cur.fetchall()]
+        
+        # Sort by the numeric part after '#'
+        def get_leg_number(row):
+            tag = row.get('leg_tag', '')
+            if '#' in tag:
+                try:
+                    return int(tag.split('#')[1])
+                except (ValueError, IndexError):
+                    return 999  # Put invalid ones at the end
+            return 999
+        
+        rows.sort(key=get_leg_number)
+        return rows
 
 def update_leg_targets(group_key: str, leg_tag: str, *, sl: float | None = None, tp: float | None = None) -> None:
     """Persist desired SL/TP targets into legs_index for a specific leg.
