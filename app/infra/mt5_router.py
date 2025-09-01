@@ -1,0 +1,792 @@
+# app/infra/mt5_router.py
+from __future__ import annotations
+import os, logging, time, re, json
+from typing import Optional, List, Tuple, Dict, Any
+from dotenv import load_dotenv
+
+from app.models import Action, RouterResult, Leg
+from app.infra.router import IRouter
+from app.common.config import Config
+
+load_dotenv(override=True)
+log = logging.getLogger("mt5_router")
+
+ACTIONS_DIR = os.environ.get("MT5_ACTIONS_DIR", os.path.join(os.getcwd(), "mt5_actions"))
+os.makedirs(ACTIONS_DIR, exist_ok=True)
+
+MODE = os.environ.get("ROUTER_MODE", "live").lower()          # "live" | "paper"
+BACKEND = os.environ.get("ROUTER_BACKEND", "file").lower()    # "native" | "file"
+SUPPRESS_NETTING_WARN = os.environ.get("MT5_SUPPRESS_NETTING_WARNING", "false").lower() in ("1","true","yes")
+
+# New safety: default OFF
+ALLOW_OPEN_ON_MODIFY = os.environ.get("ALLOW_OPEN_ON_MODIFY", "false").lower() in ("1","true","yes")
+ALLOW_SYMBOL_FALLBACK = os.environ.get("MT5_ALLOW_SYMBOL_FALLBACK", "false").lower() in ("1","true","yes")
+
+# --- Human-readable helpers (additive; JSON logs remain unchanged) -----------
+def _pp_enabled() -> bool:
+    return os.environ.get("HUMAN_PRETTY_JSON", "false").lower() in ("1", "true", "yes")
+
+def _human_error_line(payload: dict) -> str:
+    """Build a compact one-liner from an MT5 error details dict."""
+    rc   = payload.get("retcode_label") or payload.get("retcode") or "NA"
+    msg  = payload.get("server_comment") or payload.get("comment") or ""
+    reqc = payload.get("request_comment") or ""
+    order = payload.get("order") or 0
+    deal  = payload.get("deal") or 0
+    req   = payload.get("request", {}) or {}
+    sym   = req.get("symbol") or "NA"
+    action = req.get("action")
+    pos    = req.get("position") or 0
+    return (f"MT5_ERROR rc={rc} symbol={sym} action={action} "
+            f"order={order} deal={deal} position={pos} req_comment={reqc} msg={msg}")
+
+def _write_action_line(action_id: str, leg: Leg, action_type: str) -> None:
+    safe_leg = leg.leg_id.replace("#", "_")
+    base = f"{action_id}_{safe_leg}.csv"
+    filename = os.path.join(ACTIONS_DIR, base)
+    # Ultra-safe uniqueness
+    if os.path.exists(filename):
+        nonce = str(int(time.time() * 1000))[-6:]
+        filename = os.path.join(ACTIONS_DIR, f"{action_id}_{safe_leg}_{nonce}.csv")
+
+    cols = ["action_id","type","symbol","side","volume","entry","sl","tp","tag","mode"]
+    vals = [
+        action_id, action_type, leg.symbol, leg.side, f"{leg.volume:.2f}",
+        "" if leg.entry is None else f"{leg.entry:.2f}",
+        "" if leg.sl    is None else f"{leg.sl:.2f}",
+        "" if leg.tp    is None else f"{leg.tp:.2f}",
+        (leg.tag or leg.leg_id or ""), MODE
+    ]
+    with open(filename, "w", encoding="utf-8", newline="") as f:
+        f.write(",".join(cols) + "\n"); f.write(",".join(vals) + "\n")
+
+class FileDropRouter(IRouter):
+    def execute(self, action: Action) -> RouterResult:
+        try:
+            if action.type not in ("OPEN","MODIFY","CLOSE","CANCEL"):
+                return RouterResult(action_id=action.action_id, status="ERROR", error_code=4000,
+                                    error_text=f"Unsupported action type {action.type}")
+            for leg in action.legs:
+                _write_action_line(action.action_id, leg, action.type)
+            return RouterResult(action_id=action.action_id,status="OK",
+                                details={"backend":"file","legs":[l.leg_id for l in action.legs], "mode": MODE, "files_written": len(action.legs)})
+        except Exception as ex:
+            return RouterResult(action_id=action.action_id, status="ERROR", error_code=5000, error_text=str(ex))
+
+_NETTING_WARNED = False
+
+class Mt5NativeRouter(IRouter):
+    def __init__(self, cfg: Config | None = None):
+        try:
+            if hasattr(self, 'cfg') and getattr(self.cfg, 'MT5_FIRST_PRICE_WORSE_PIPS', 0.0):
+                log.info('CFG_TOL_PIPS | %.3f', float(self.cfg.MT5_FIRST_PRICE_WORSE_PIPS))
+        except Exception:
+            pass
+        self._modify_seen = {}
+
+        try:
+            import MetaTrader5 as mt5  # type: ignore
+        except Exception as e:
+            raise RuntimeError("MetaTrader5 package not installed. Try: pip install MetaTrader5") from e
+        self.mt5 = mt5
+        self.cfg = cfg
+        self.magic = int(getattr(cfg,'MT5_MAGIC', os.environ.get('MT5_MAGIC','86012345')))
+        self.deviation = int(getattr(cfg,'MT5_DEVIATION', os.environ.get('MT5_DEVIATION','10')))
+        self.type_filling = int(getattr(cfg,'MT5_FILLING', os.environ.get('MT5_FILLING', str(getattr(mt5,'ORDER_FILLING_IOC',2)))))
+        self.symbol_suffix = getattr(cfg,'SYMBOL_SUFFIX', os.environ.get('SYMBOL_SUFFIX',''))
+        self.path = getattr(cfg,'MT5_PATH', os.environ.get('MT5_PATH'))
+        self.login = getattr(cfg,'MT5_LOGIN', os.environ.get('MT5_LOGIN'))
+        self.password = getattr(cfg,'MT5_PASSWORD', os.environ.get('MT5_PASSWORD'))
+        self.server = getattr(cfg,'MT5_SERVER', os.environ.get('MT5_SERVER'))
+        self._ensure_initialized()
+        self._fill_cache = {}  # (symbol, is_market) -> 'RETURN'|'IOC'|'FOK'
+        # Prewarm filling modes per symbol before orders come in
+        try:
+            self._prewarm_fillings()
+        except Exception:
+            pass
+
+    def _prewarm_fillings(self):
+        """Populate fill cache for known symbols (market & pending) from broker capabilities."""
+        symbols = []
+        # From env list (comma/space/semicolon separated)
+        raw = os.environ.get("MT5_PRELOAD_SYMBOLS", "")
+        if raw:
+            for tok in re.split(r"[\s,;]+", raw.strip()):
+                if tok:
+                    symbols.append(tok)
+        # Ensure DEFAULT_SYMBOL is included if set
+        default_sym = os.environ.get("DEFAULT_SYMBOL") or "XAUUSD"
+        if default_sym and default_sym not in symbols:
+            symbols.append(default_sym)
+        # Apply broker suffix if any
+        suf = self.symbol_suffix or ""
+        symbols = [s + suf if suf and not s.endswith(suf) else s for s in symbols]
+
+        for sym in symbols:
+            allowed = set(self._allowed_fillings(sym))
+            # Market: prefer IOC/FOK then RETURN
+            m_seq = [p for p in ["IOC","FOK","RETURN"] if p in allowed] or ["RETURN"]
+            p_seq = [p for p in ["RETURN","IOC","FOK"] if p in allowed] or ["RETURN"]
+            if m_seq:
+                self._fill_cache[(sym, True)] = m_seq[0]
+            if p_seq:
+                self._fill_cache[(sym, False)] = p_seq[0]
+            try:
+                log.info("MT5_FILL_PREWARM | symbol=%s market=%s pending=%s", sym, self._fill_cache.get((sym, True)), self._fill_cache.get((sym, False)))
+            except Exception:
+                pass
+
+
+    def _ensure_initialized(self):
+        global _NETTING_WARNED
+        mt5 = self.mt5
+        ok = mt5.initialize(self.path) if self.path else mt5.initialize()
+        if not ok: raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
+        if self.login and self.password and self.server:
+            if not mt5.login(login=int(self.login), password=self.password, server=self.server):
+                raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
+        acc = mt5.account_info()
+        if acc is None: raise RuntimeError(f"MT5 account_info failed: {mt5.last_error()}")
+        if not SUPPRESS_NETTING_WARN and not _NETTING_WARNED:
+            margin_mode = getattr(acc, "margin_mode", None)
+            if margin_mode != 2:
+                log.warning("Account not hedging (margin_mode=%s). Per-leg positions may net.", margin_mode)
+            _NETTING_WARNED = True
+
+    def _apply_suffix(self, symbol: str) -> str:
+        return symbol + self.symbol_suffix if self.symbol_suffix and not symbol.endswith(self.symbol_suffix) else symbol
+
+    def _ensure_symbol(self, symbol: str) -> str:
+        mt5 = self.mt5
+        s = self._apply_suffix(symbol)
+        info = mt5.symbol_info(s)
+        if info is None or not info.visible:
+            if not mt5.symbol_select(s, True):
+                raise RuntimeError(f"Symbol {s} not visible/selectable")
+        return s
+
+    def _symbol_point(self, symbol: str) -> float:
+        si = self.mt5.symbol_info(symbol); return float(getattr(si, "point", 0.0) or 0.0)
+
+    def _pip_size_in_price_units(self, symbol: str) -> float:
+        pt = self._symbol_point(symbol) or 0.0
+        # default heuristic: 1 pip = 10 * point
+        try:
+            ovs = getattr(getattr(self, 'cfg', None), 'PIP_SIZE_OVERRIDES', {}) or {}
+            base = (symbol or '').upper()
+            key = re.sub(r'[^A-Z]', '', base)
+            if base in ovs: return float(ovs[base])
+            if key in ovs: return float(ovs[key])
+        except Exception:
+            pass
+        return 10.0 * float(pt)
+
+    def _effective_worse_pips(self, symbol: str) -> float:
+        # canonical var
+        cfg = getattr(self, 'cfg', None)
+        try:
+            v = float(getattr(cfg, 'MT5_FIRST_PRICE_WORSE_PIPS', 0.0) or 0.0)
+        except Exception:
+            v = 0.0
+        if v > 0: return v
+        # legacy shims
+        try:
+            lv = float(getattr(cfg, 'MT5_FIRST_LEG_WORSE_PIPS', 0.0) or 0.0)
+        except Exception:
+            lv = 0.0
+        if lv > 0:
+            try: log.warning('DEPRECATED: MT5_FIRST_LEG_WORSE_PIPS; use MT5_FIRST_PRICE_WORSE_PIPS.')
+            except Exception: pass
+            return lv
+        try:
+            lp = float(getattr(cfg, 'MT5_FIRST_LEG_WORSE_PRICE', 0.0) or 0.0)
+        except Exception:
+            lp = 0.0
+        if lp > 0:
+            pip = self._pip_size_in_price_units(symbol) or 1.0
+            conv = float(lp) / float(pip)
+            try: log.warning('DEPRECATED: MT5_FIRST_LEG_WORSE_PRICE converted to ~%.3f pips for %s', conv, symbol)
+            except Exception: pass
+            return conv
+        return 0.0
+
+    def _tick(self, symbol: str) -> Tuple[float, float]:
+        mt5 = self.mt5
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None: raise RuntimeError(f"No tick for {symbol}")
+        return float(getattr(tick, "ask", 0.0)), float(getattr(tick, "bid", 0.0))
+
+    def _comment_key(self, action: Action, leg: Leg) -> str:
+        """
+        Build a server-safe, short per-leg comment with the leg index up front.
+        Examples: "1259_5:XAUUSD" (preferred) or "1259_5" fallback.
+        """
+        max_len = int(os.getenv("MT5_COMMENT_MAXLEN", "16"))
+
+        base = (getattr(action, "source_msg_id", None) or
+                getattr(action, "action_id", None) or "")
+        raw = (getattr(leg, "tag", None) or
+            getattr(leg, "leg_id", None) or "")
+        raw = str(raw).replace("#", "_")
+
+        # extract leg index from "..._<digits>" if present
+        m = re.search(r'(?:_|#)(\d+)$', raw)
+        leg_idx = m.group(1) if m else "1"
+
+        sym = (getattr(leg, "symbol", "") or "").upper()
+        sym_short = re.sub(r'[^A-Z]', '', sym)[:6]  # keep letters only, up to 6
+
+        # 1) preferred: "<msgId>_<legIdx>:<symShort>"
+        key = f"{base}_{leg_idx}:{sym_short}" if sym_short else f"{base}_{leg_idx}"
+        if len(key) <= max_len:
+            return key
+
+        # 2) fallback: "<msgId>_<legIdx>"
+        key2 = f"{base}_{leg_idx}"
+        if len(key2) <= max_len:
+            return key2
+
+        # 3) final fallback: last N digits of msgId + legIdx
+        keep = max_len - (1 + len(leg_idx))  # space for "_" and leg_idx
+        base_tail = base[-keep:] if keep > 0 else ""
+        final_key = f"{base_tail}_{leg_idx}"
+        return final_key[:max_len]
+
+    def _retcode_label(self, code: Optional[int]) -> Optional[str]:
+        if code is None: return None
+        mt5 = self.mt5
+        mapping = {name: getattr(mt5, name) for name in dir(mt5) if name.startswith("TRADE_RETCODE_")}
+        rev: Dict[int, str] = {int(v): k for k, v in mapping.items() if isinstance(v, int)}
+        return rev.get(int(code), f"{code}")
+
+    def _fill_consts(self):
+        mt5 = self.mt5
+        return {"FOK": getattr(mt5,"ORDER_FILLING_FOK",0), "IOC": getattr(mt5,"ORDER_FILLING_IOC",1), "RETURN": getattr(mt5,"ORDER_FILLING_RETURN",2)}
+
+    def _allowed_fillings(self, symbol: str) -> List[str]:
+        mt5 = self.mt5
+        si = mt5.symbol_info(symbol); mask = int(getattr(si, "trade_fillings", 0))
+        allowed: List[str] = []
+        if mask & 1: allowed.append("FOK")
+        if mask & 2: allowed.append("IOC")
+        if mask & 4: allowed.append("RETURN")
+        return allowed or ["RETURN","IOC","FOK"]
+
+    def _fill_sequence(self, symbol: str, *, is_market: bool) -> List[str]:
+        pref_csv = os.environ.get("MT5_FILLING_PREF")
+        if pref_csv:
+            base = [p.strip().upper() for p in pref_csv.split(",")]
+        else:
+            base = ["IOC","FOK","RETURN"] if is_market else ["RETURN","IOC","FOK"]
+        allowed = set(self._allowed_fillings(symbol))
+        seq = [p for p in base if p in allowed]
+        # Prefer last known good filling for (symbol, is_market)
+        key = (symbol, bool(is_market))
+        try:
+            last = self._fill_cache.get(key)
+            if last and last in allowed:
+                # move to front if present
+                if last in seq:
+                    seq = [last] + [p for p in seq if p != last]
+                else:
+                    seq = [last] + seq
+        except Exception:
+            pass
+        # If pending orders and RETURN is allowed, bias RETURN first (MT5 common requirement)
+        try:
+            if not is_market and "RETURN" in allowed:
+                if "RETURN" in seq:
+                    seq = ["RETURN"] + [p for p in seq if p != "RETURN"]
+                else:
+                    seq = ["RETURN"] + seq
+        except Exception:
+            pass
+        return seq or [p for p in ["RETURN","IOC","FOK"] if p in allowed] or ["RETURN","IOC","FOK"]
+
+
+    def _send_with_fill_retry(self, req: dict, symbol: str):
+        mt5 = self.mt5
+        consts = self._fill_consts()
+        tried: List[str] = []
+        details: Dict[str, Any] = {}
+        is_market = (req.get('action') == self.mt5.TRADE_ACTION_DEAL)
+        for name in self._fill_sequence(symbol, is_market=is_market) or ['RETURN','IOC','FOK']:
+            req["type_filling"] = consts[name]
+            tried.append(name)
+            res = mt5.order_send(req)
+            ok = (res is not None) and (res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED))
+            details = {
+                "retcode": None if res is None else int(res.retcode),
+                "retcode_label": None if res is None else self._retcode_label(int(res.retcode)),
+                "server_comment": None if res is None else res.comment,     # what MT5 returned
+                "request_comment": req.get("comment"),                      # what we sent
+                "order":   None if res is None else int(getattr(res, "order", 0)),
+                "deal":    None if res is None else int(getattr(res, "deal", 0)),
+                "request": dict(req),
+                "tried_fillings": tried[:],
+            }
+            if ok:
+                try:
+                    key = (symbol, bool(is_market))
+                    self._fill_cache[key] = name
+                except Exception:
+                    pass
+                return True, details
+            # retry on invalid filling mode
+            if res is not None and int(res.retcode) == 10030:
+                continue
+            # keep original JSON error, add human-readable companion + optional pretty JSON
+            log.error("MT5_ORDER_ERROR %s", details)
+            try:
+                log.error(_human_error_line(details))
+            except Exception:
+                pass
+            if _pp_enabled():
+                try:
+                    log.info("MT5_ERROR_DETAILS\n%s", json.dumps(details, indent=2))
+                except Exception:
+                    pass
+            return False, details
+        # final failure path
+        log.error("MT5_ORDER_ERROR %s", details)
+        try:
+            log.error(_human_error_line(details))
+        except Exception:
+            pass
+        if _pp_enabled():
+            try:
+                log.info("MT5_ERROR_DETAILS\n%s", json.dumps(details, indent=2))
+            except Exception:
+                pass
+        return False, details
+
+    @staticmethod
+    def _n0(x): return 0.0 if x is None else float(x)
+
+    def _compute_first_entry_value(self, action: Action) -> float | None:
+        """Return the first entry price used in this action (first leg with a non-None entry)."""
+        try:
+            for lg in action.legs:
+                if getattr(lg, "entry", None) is not None:
+                    return float(lg.entry)
+        except Exception:
+            pass
+        return None
+    
+    def _is_first_leg(self, leg: Leg) -> bool:
+        # If we know the first entry value for this action, treat any leg that
+        # uses that first entry price (within 1 point) as a 'first-entry' leg.
+        v = getattr(self, "_first_entry_value", None)
+        if v is not None and getattr(leg, "entry", None) is not None:
+            try:
+                tol = self._symbol_point(leg.symbol) or 0.0
+                return abs(float(leg.entry) - float(v)) <= max(tol, 1e-12)
+            except Exception:
+                pass
+        # Fallback to legacy behavior: only the literal #1 leg gets special handling
+        return str(getattr(leg, "leg_id", "")).endswith("#1")
+
+    def _first_leg_tolerance(self, symbol: str) -> float:
+        pips = self._effective_worse_pips(symbol)
+        if pips <= 0:
+            return 0.0
+        pip_sz = self._pip_size_in_price_units(symbol) or 0.0
+        return float(pips) * float(pip_sz)
+
+    def _market_or_limit_type(self, side: str, entry: float, ask: float, bid: float, *, first_leg: bool, symbol: str):
+        mt5 = self.mt5
+        if first_leg:
+            tol = self._first_leg_tolerance(symbol)
+            # one-time diagnostic for effective tolerance per symbol
+            try:
+                logged = getattr(self, "_pip_logged_symbols", None)
+                if logged is None:
+                    self._pip_logged_symbols = set()
+                    logged = self._pip_logged_symbols
+                if symbol not in logged:
+                    pip_sz = self._pip_size_in_price_units(symbol)
+                    pips_val = (tol / pip_sz) if pip_sz else 0.0
+                    log.info("FIRST_PRICE_TOL | symbol=%s pip=%.5f tol=%.5f pips=%.3f",
+                             symbol, pip_sz, tol, pips_val)
+                    logged.add(symbol)
+            except Exception:
+                pass
+
+            if side == "BUY":
+                thresh = entry + tol
+                return (mt5.ORDER_TYPE_BUY, ask) if ask <= thresh else (mt5.ORDER_TYPE_BUY_LIMIT, thresh)
+            else:
+                thresh = entry - tol
+                return (mt5.ORDER_TYPE_SELL, bid) if bid >= thresh else (mt5.ORDER_TYPE_SELL_LIMIT, thresh)
+        else:
+            if side == "BUY":
+                return (mt5.ORDER_TYPE_BUY, ask) if ask <= entry else (mt5.ORDER_TYPE_BUY_LIMIT, entry)
+            else:
+                return (mt5.ORDER_TYPE_SELL, bid) if bid >= entry else (mt5.ORDER_TYPE_SELL_LIMIT, entry)
+    def _find_position(self, symbol: str, comment_key: str):
+        """
+        Try to find a live position by the per-leg comment key.
+        Not all brokers propagate comments to positions; this is a best-effort.
+        """
+        mt5 = self.mt5
+        try:
+            positions = mt5.positions_get(symbol=symbol) or []
+        except Exception:
+            positions = []
+        for p in positions:
+            try:
+                if getattr(p, "comment", None) == comment_key:
+                    return p
+            except Exception:
+                continue
+        return None
+
+    def _find_order(self, symbol: str, comment_key: str):
+        """
+        Try to find a pending order by the per-leg comment key.
+        """
+        mt5 = self.mt5
+        try:
+            orders = mt5.orders_get(symbol=symbol) or []
+        except Exception:
+            orders = []
+        for o in orders:
+            try:
+                if getattr(o, "comment", None) == comment_key:
+                    return o
+            except Exception:
+                continue
+        return None
+
+    def _resolve_position_by_symbol_magic(self, symbol: str, magic: int):
+        """
+        Fallback resolution if we only have an order ticket and it has likely filled.
+        Choose the freshest position on this symbol, prioritizing our magic if present.
+        """
+        mt5 = self.mt5
+        try:
+            positions = mt5.positions_get(symbol=symbol) or []
+        except Exception:
+            positions = []
+        if not positions:
+            return None
+        cand = [p for p in positions if getattr(p, "magic", None) == magic]
+        if not cand:
+            cand = positions
+        try:
+            return max(cand, key=lambda p: getattr(p, "time", 0))
+        except Exception:
+            return cand[0] if cand else None
+
+    # ------------------------------
+    # OPEN / MODIFY / CLOSE / CANCEL
+    # ------------------------------
+    def _handle_open_leg(self, symbol: str, action: Action, leg: Leg):
+        mt5 = self.mt5
+        if leg.entry is None:
+            ask, bid = self._tick(symbol)
+            order_type = mt5.ORDER_TYPE_BUY if leg.side == "BUY" else mt5.ORDER_TYPE_SELL
+            price = ask if leg.side == "BUY" else bid
+        else:
+            ask, bid = self._tick(symbol)
+            order_type, price = self._market_or_limit_type(leg.side, float(leg.entry), ask, bid,
+                                                           first_leg=self._is_first_leg(leg), symbol=symbol)
+        comment_key = self._comment_key(action, leg)
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL if order_type in (mt5.ORDER_TYPE_BUY, mt5.ORDER_TYPE_SELL) else mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol, "volume": float(leg.volume), "type": order_type, "price": float(price),
+            "deviation": self.deviation, "magic": self.magic, "comment": comment_key, "type_time": mt5.ORDER_TIME_GTC,
+        }
+        if leg.sl is not None: req["sl"] = float(leg.sl)
+        if leg.tp is not None: req["tp"] = float(leg.tp)
+        ok, details = self._send_with_fill_retry(req, symbol)
+        # Attach live position ticket immediately for market deals
+        try:
+            if ok and req.get("action") == mt5.TRADE_ACTION_DEAL:
+                pos = self._find_position(symbol, comment_key)
+                if pos is not None:
+                    details = dict(details)
+                    details["position"] = int(getattr(pos, "ticket", 0))
+        except Exception:
+            pass
+        return {"ok": ok, "details": details}
+
+
+    def _handle_modify_leg(self, symbol: str, action: Action, leg: Leg):
+        """
+        Hedging-safe MODIFY resolution order:
+          1) position_ticket -> SLTP
+          2) comment -> position (exact comment match)
+          3) order_ticket -> MODIFY (only if order still exists = pending)
+          4) comment -> order
+          5) (optional) symbol/magic fallback (disabled by default; set MT5_ALLOW_SYMBOL_FALLBACK=1 to enable)
+          6) if still nothing: optionally OPEN on MODIFY (if ALLOW_OPEN_ON_MODIFY)
+        """
+        mt5 = self.mt5
+        comment_key = self._comment_key(action, leg)
+
+        # 1) Direct by position_ticket
+        if getattr(leg, "position_ticket", None):
+            seen = self._modify_seen.setdefault(action.action_id, set())
+            key = "pos:" + str(int(leg.position_ticket))
+            if key in seen:
+                log.info("MGMT_COALESCE", extra={"event":"MGMT_COALESCE","gk": f"OPEN_{action.source_msg_id}","ticket_key": key,"note":"skip duplicate modify in same action"})
+                return {"skipped": True, "reason": "dedup_same_ticket"}
+            seen.add(key)
+
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": int(leg.position_ticket),
+                "symbol": symbol,
+                "deviation": self.deviation,
+                "magic": self.magic,
+                "comment": comment_key,
+            }
+            if leg.sl is not None and float(leg.sl) > 0: req["sl"] = float(leg.sl)
+            if leg.tp is not None and float(leg.tp) > 0: req["tp"] = float(leg.tp)
+            log.info("MGMT_RESOLVE", extra={"event":"MGMT_RESOLVE","gk": f"OPEN_{action.source_msg_id}","tag": getattr(leg,"tag", getattr(leg,"leg_id", None)),"symbol": symbol,"resolved_by":"position_ticket","position_ticket": int(leg.position_ticket)})
+            ok, details = self._send_with_fill_retry(req, symbol)
+            return {"ok": ok, "target": "position", "ticket": int(leg.position_ticket), "details": details}
+
+        # 2) Comment -> position (hedging-safe exact mapping)
+        pos = self._find_position(symbol, comment_key)
+        if pos is not None:
+            seen = self._modify_seen.setdefault(action.action_id, set())
+            key = "pos:" + str(int(pos.ticket))
+            if key in seen:
+                log.info("MGMT_COALESCE", extra={"event":"MGMT_COALESCE","gk": f"OPEN_{action.source_msg_id}","ticket_key": key,"note":"skip duplicate modify in same action"})
+                return {"skipped": True, "reason": "dedup_same_ticket"}
+            seen.add(key)
+
+            req = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": int(pos.ticket),
+                "symbol": symbol,
+                "deviation": self.deviation,
+                "magic": self.magic,
+                "comment": comment_key,
+            }
+            if leg.sl is not None and float(leg.sl) > 0: req["sl"] = float(leg.sl)
+            if leg.tp is not None and float(leg.tp) > 0: req["tp"] = float(leg.tp)
+            log.info("MGMT_RESOLVE", extra={"event":"MGMT_RESOLVE","gk": f"OPEN_{action.source_msg_id}","tag": getattr(leg,"tag", getattr(leg,"leg_id", None)),"symbol": symbol,"resolved_by":"comment->position","position_ticket": int(pos.ticket)})
+            ok, details = self._send_with_fill_retry(req, symbol)
+            return {"ok": ok, "target": "position", "ticket": int(pos.ticket), "details": details}
+
+        # 3) order_ticket -> only if order still exists (pending)
+        if getattr(leg, "order_ticket", None):
+            try:
+                orders = self.mt5.orders_get(symbol=symbol) or []
+            except Exception:
+                orders = []
+            ord_match = None
+            for o in orders:
+                if int(getattr(o, "ticket", 0)) == int(leg.order_ticket):
+                    ord_match = o; break
+            if ord_match is not None:
+                seen = self._modify_seen.setdefault(action.action_id, set())
+                key = "ord:" + str(int(leg.order_ticket))
+                if key in seen:
+                    log.info("MGMT_COALESCE", extra={"event":"MGMT_COALESCE","gk": f"OPEN_{action.source_msg_id}","ticket_key": key,"note":"skip duplicate modify in same action"})
+                    return {"skipped": True, "reason": "dedup_same_ticket"}
+                seen.add(key)
+
+                new_price = float(leg.entry) if (leg.entry is not None) else float(getattr(ord_match, "price_current", getattr(ord_match, "price_open", 0.0)))
+                req = {
+                    "action": mt5.TRADE_ACTION_MODIFY,
+                    "order": int(leg.order_ticket),
+                    "price": new_price,
+                    "symbol": symbol,
+                    "deviation": self.deviation,
+                    "magic": self.magic,
+                    "comment": comment_key,
+                }
+                if leg.sl is not None and float(leg.sl) > 0: req["sl"] = float(leg.sl)
+                if leg.tp is not None and float(leg.tp) > 0: req["tp"] = float(leg.tp)
+                log.info("MGMT_RESOLVE", extra={"event":"MGMT_RESOLVE","gk": f"OPEN_{action.source_msg_id}","tag": getattr(leg,"tag", getattr(leg,"leg_id", None)),"symbol": symbol,"resolved_by":"order_ticket","order_ticket": int(leg.order_ticket)})
+                ok, details = self._send_with_fill_retry(req, symbol)
+                if ok:
+                    return {"ok": ok, "target": "order", "ticket": int(leg.order_ticket), "details": details}
+
+        # 4) comment -> order (pending by comment)
+        ord = self._find_order(symbol, comment_key)
+        if ord is not None:
+            seen = self._modify_seen.setdefault(action.action_id, set())
+            key = "ord:" + str(int(ord.ticket))
+            if key in seen:
+                log.info("MGMT_COALESCE", extra={"event":"MGMT_COALESCE","gk": f"OPEN_{action.source_msg_id}","ticket_key": key,"note":"skip duplicate modify in same action"})
+                return {"skipped": True, "reason": "dedup_same_ticket"}
+            seen.add(key)
+
+            new_price = float(getattr(ord, "price_current", getattr(ord, "price_open", 0.0)))
+            if leg.entry is not None: new_price = float(leg.entry)
+            req = {
+                "action": mt5.TRADE_ACTION_MODIFY,
+                "order": int(ord.ticket),
+                "price": new_price,
+                "symbol": symbol,
+                "deviation": self.deviation,
+                "magic": self.magic,
+                "comment": comment_key,
+            }
+            if leg.sl is not None and float(leg.sl) > 0: req["sl"] = float(leg.sl)
+            if leg.tp is not None and float(leg.tp) > 0: req["tp"] = float(leg.tp)
+            log.info("MGMT_RESOLVE", extra={"event":"MGMT_RESOLVE","gk": f"OPEN_{action.source_msg_id}","tag": getattr(leg,"tag", getattr(leg,"leg_id", None)),"symbol": symbol,"resolved_by":"comment->order","order_ticket": int(ord.ticket)})
+            ok, details = self._send_with_fill_retry(req, symbol)
+            if ok:
+                return {"ok": ok, "target": "order", "ticket": int(ord.ticket), "details": details}
+
+        # 5) Optional: symbol/magic fallback (disabled by default; useful on netting)
+        if ALLOW_SYMBOL_FALLBACK:
+            pos = self._resolve_position_by_symbol_magic(symbol, self.magic)
+            if pos is not None:
+                seen = self._modify_seen.setdefault(action.action_id, set())
+                key = "pos:" + str(int(pos.ticket))
+                if key in seen:
+                    log.info("MGMT_COALESCE", extra={"event":"MGMT_COALESCE","gk": f"OPEN_{action.source_msg_id}","ticket_key": key,"note":"skip duplicate modify in same action"})
+                    return {"skipped": True, "reason": "dedup_same_ticket"}
+                seen.add(key)
+
+                req = {
+                    "action": mt5.TRADE_ACTION_SLTP,
+                    "position": int(pos.ticket),
+                    "symbol": symbol,
+                    "deviation": self.deviation,
+                    "magic": self.magic,
+                    "comment": comment_key,
+                }
+                if leg.sl is not None and float(leg.sl) > 0: req["sl"] = float(leg.sl)
+                if leg.tp is not None and float(leg.tp) > 0: req["tp"] = float(leg.tp)
+                log.info("MGMT_RESOLVE", extra={"event":"MGMT_RESOLVE","gk": f"OPEN_{action.source_msg_id}","tag": getattr(leg,"tag", getattr(leg,"leg_id", None)),"symbol": symbol,"resolved_by":"symbol->position","position_ticket": int(pos.ticket)})
+                ok, details = self._send_with_fill_retry(req, symbol)
+                return {"ok": ok, "target": "position", "ticket": int(pos.ticket), "details": details}
+
+        # 6) Else: nothing to modify
+        if not ALLOW_OPEN_ON_MODIFY:
+            log.info("MGMT_RESOLVE", extra={"event":"MGMT_RESOLVE","gk": f"OPEN_{action.source_msg_id}","tag": getattr(leg,"tag", getattr(leg,"leg_id", None)),"symbol": symbol,"resolved_by":"none","note":"no_position_or_order"})
+            return {"skipped": True, "reason": "no_position_or_order"}
+
+        # If allowed, fall through to open
+        return self._handle_open_leg(symbol, action, leg)
+
+
+    def _handle_close_leg(self, symbol: str, action: Action, leg: Leg):
+        mt5 = self.mt5
+        comment_key = self._comment_key(action, leg); pos = self._find_position(symbol, comment_key)
+        if pos is None: return {"skipped": True, "reason": "no_position"}
+        ask, bid = self._tick(symbol)
+        if pos.type == mt5.POSITION_TYPE_BUY: req_type, price = mt5.ORDER_TYPE_SELL, bid
+        else:                                  req_type, price = mt5.ORDER_TYPE_BUY, ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL, "position": int(pos.ticket), "symbol": symbol,
+            "volume": float(min(float(leg.volume), float(pos.volume))), "type": req_type, "price": float(price),
+            "deviation": self.deviation, "magic": self.magic, "comment": comment_key+"|close",
+            "type_time": mt5.ORDER_TIME_GTC,
+        }
+        ok, details = self._send_with_fill_retry(req, symbol)
+        # Attach live position ticket immediately for market deals
+        try:
+            if ok and req.get("action") == mt5.TRADE_ACTION_DEAL:
+                pos = self._find_position(symbol, comment_key)
+                if pos is not None:
+                    details = dict(details)
+                    details["position"] = int(getattr(pos, "ticket", 0))
+        except Exception:
+            pass
+        return {"ok": ok, "details": details}
+
+    
+    def _handle_cancel_leg(self, symbol: str, action: Action, leg: Leg):
+        mt5 = self.mt5
+        comment_key = self._comment_key(action, leg)
+        # Prefer explicit order_ticket when provided (more precise than lookup by comment)
+        explicit_order = getattr(leg, "order_ticket", None)
+        ord_ticket = int(explicit_order) if explicit_order else None
+        ord = None
+        if ord_ticket:
+            # Lightweight struct to mimic mt5.ORDER
+            class _TmpOrd: pass
+            ord = _TmpOrd()
+            ord.ticket = ord_ticket
+        else:
+            ord = self._find_order(symbol, comment_key)
+        if ord is None:
+            return {"skipped": True, "reason": "no_order"}
+        req = {"action": mt5.TRADE_ACTION_REMOVE, "order": int(ord.ticket), "symbol": symbol,
+            "deviation": self.deviation, "magic": self.magic, "comment": comment_key+"|cancel"}
+        res = mt5.order_send(req)
+        ok = (res is not None) and (res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED))
+        details = {
+            "retcode": None if res is None else int(res.retcode),
+            "retcode_label": None if res is None else self._retcode_label(int(res.retcode)),
+            "server_comment": None if res is None else res.comment,
+            "comment": None if res is None else res.comment,  # keep backward-compat
+            "order":   None if res is None else int(getattr(res, "order", 0)),
+            "deal":    None if res is None else int(getattr(res, "deal", 0)),
+            "request": dict(req),
+        }
+
+        ok = (res is not None) and (res.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED))
+        details = {
+            "retcode": None if res is None else int(res.retcode),
+            "retcode_label": None if res is None else self._retcode_label(int(res.retcode)),
+            "server_comment": None if res is None else res.comment,
+            "comment": None if res is None else res.comment,  # keep backward-compat
+            "order":   None if res is None else int(getattr(res, "order", 0)),
+            "deal":    None if res is None else int(getattr(res, "deal", 0)),
+            "request": dict(req),
+        }
+        if not ok:
+            log.error("MT5_ORDER_ERROR %s", details)
+            try:
+                log.error(_human_error_line(details))
+            except Exception:
+                pass
+            if _pp_enabled():
+                try:
+                    log.info("MT5_ERROR_DETAILS\n%s", json.dumps(details, indent=2))
+                except Exception:
+                    pass
+        return {"ok": ok, "details": details}
+
+    def execute(self, action: Action) -> RouterResult:
+        try:
+            if action.type not in ("OPEN","MODIFY","CLOSE","CANCEL"):
+                return RouterResult(action_id=action.action_id, status="ERROR", error_code=4000,
+                                    error_text=f"Unsupported action type {action.type}")
+            results = []
+            # Cache the first entry value for this action so all legs
+            # that share the first entry get the same wriggle/threshold treatment.
+            self._first_entry_value = self._compute_first_entry_value(action)
+            for leg in action.legs:
+                sym = self._ensure_symbol(leg.symbol)
+                if action.type == "OPEN":
+                    r = self._handle_open_leg(sym, action, leg)
+                elif action.type == "MODIFY":
+                    r = self._handle_modify_leg(sym, action, leg)
+                elif action.type == "CLOSE":
+                    r = self._handle_close_leg(sym, action, leg)
+                else:
+                    r = self._handle_cancel_leg(sym, action, leg)
+                results.append({"leg": leg.leg_id, "result": r})
+            out = RouterResult(action_id=action.action_id, status="OK", details={"backend":"native","mode":MODE,"results":results})
+            # clear dedup marks for this action_id
+            if action.action_id in self._modify_seen:
+                try: del self._modify_seen[action.action_id]
+                except Exception: pass
+            try:
+                del self._first_entry_value
+            except Exception:
+                pass
+            return out
+        except Exception as ex:
+            return RouterResult(action_id=action.action_id, status="ERROR", error_code=5001, error_text=str(ex))
+
+_ROUTER_SINGLETON: Optional[IRouter] = None
+def get_router() -> IRouter:
+    global _ROUTER_SINGLETON
+    if _ROUTER_SINGLETON is not None:
+        return _ROUTER_SINGLETON
+    cfg = Config()
+    _ROUTER_SINGLETON = Mt5NativeRouter(cfg) if BACKEND == "native" else FileDropRouter()
+    return _ROUTER_SINGLETON
