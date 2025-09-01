@@ -1,13 +1,8 @@
 == POSITIONS ==
-ticket=378890185 sym=XAUUSD+ comment="2472_2:XAUUSD" -> mid=2472 leg=2 sym_sfx=XAUUSD
-ticket=378890186 sym=XAUUSD+ comment="2472_3:XAUUSD" -> mid=2472 leg=3 sym_sfx=XAUUSD
-ticket=378890188 sym=XAUUSD+ comment="2472_4:XAUUSD" -> mid=2472 leg=4 sym_sfx=XAUUSD
+ticket=379031185 sym=XAUUSD+ comment="2478_2:XAUUSD" -> mid=2478 leg=2 sym_sfx=XAUUSD
+ticket=379031188 sym=XAUUSD+ comment="2478_3:XAUUSD" -> mid=2478 leg=3 sym_sfx=XAUUSD
+ticket=379031190 sym=XAUUSD+ comment="2478_4:XAUUSD" -> mid=2478 leg=4 sym_sfx=XAUUSD
 
 == ORDERS ==
-ticket=378890189 sym=XAUUSD+ comment="2472_5:XAUUSD" -> mid=2472 leg=5 sym_sfx=XAUUSD
-ticket=378890192 sym=XAUUSD+ comment="2472_6:XAUUSD" -> mid=2472 leg=6 sym_sfx=XAUUSD
-ticket=378890195 sym=XAUUSD+ comment="2472_7:XAUUSD" -> mid=2472 leg=7 sym_sfx=XAUUSD
-ticket=378890196 sym=XAUUSD+ comment="2472_8:XAUUSD" -> mid=2472 leg=8 sym_sfx=XAUUSD
-ticket=378890417 sym=XAUUSD+ comment="" -> mid=None leg=None sym_sfx=None
-ticket=378890418 sym=XAUUSD+ comment="" -> mid=None leg=None sym_sfx=None
-ticket=378890419 sym=XAUUSD+ comment="" -> mid=None leg=None sym_sfx=None
+ticket=379035351 sym=XAUUSD+ comment="" -> mid=None leg=None sym_sfx=None
+ticket=379035352 sym=XAUUSD+ comment="" -> mid=None leg=None sym_sfx=None
