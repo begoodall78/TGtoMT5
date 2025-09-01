@@ -1,0 +1,13 @@
+V1.0
+
+working with incorrect signal interpretation
+
+v2.0
+signal interp now correct, but MQL5 not working
+dev paused to move to all py driven approach
+
+v2.5
+big change to structure but not really working and hard to chase down bugs
+
+v3.0
+MASSIVE change to structure 

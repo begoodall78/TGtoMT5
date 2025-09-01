@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment & secrets
+.env
+runtime/sessions/*
+!runtime/sessions/.gitkeep
+
+# Runtime data (not tracked)
+runtime/logs/*
+runtime/actions/inbox/*
+runtime/actions/ack/*
+runtime/actions/archive/*
+runtime/tmp/*
+runtime/outputs/*
+runtime/data/*
+
+# OS cruft
+Thumbs.db
+.DS_Store

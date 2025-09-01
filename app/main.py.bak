@@ -1,11 +1,9 @@
-# app/main.py - Updated with centralized initialization
 import os, sqlite3, json
 from collections import Counter
 import typer
 
-# New centralized initialization
-from app.common.app_init import initialize_cli_tool
-from app.storage import enqueue
+from app.common.logging_config import setup_logging
+from app.storage import init_db, enqueue
 from app.infra.actions_runner import run_forever, process_once
 from app.models import Action, Leg
 from app.processing import build_actions_from_message
@@ -15,32 +13,19 @@ app = typer.Typer(no_args_is_help=True)
 # ---------------- Commands ----------------
 
 @app.command()
-def validate_config(show_info: bool = typer.Option(True, "--show-info/--no-info")):
-    """Validate configuration and show any issues."""
-    from app.common.config_validator import validate_config, print_validation_results
-    
-    # Don't need full app initialization for config validation
-    from app.common.config import Config
-    config = Config()
-    
-    is_valid, results = validate_config(config)
-    print_validation_results(results, show_info=show_info)
-    
-    if not is_valid:
-        raise typer.Exit(1)
-
-@app.command()
 def run(log_level: str = typer.Option("INFO", "--log-level", "-l",
                                       help="DEBUG, INFO, WARNING, ERROR")):
     """Run the actions runner (process SQLite queue)."""
-    config = initialize_cli_tool(log_level)  # Replaces setup_logging + init_db
+    setup_logging(log_level)
+    init_db()
     run_forever()
 
 @app.command()
 def drain(batch: int = 64,
           log_level: str = typer.Option("INFO", "--log-level", "-l")):
     """Process up to <batch> pending actions and exit."""
-    config = initialize_cli_tool(log_level)  # Replaces setup_logging + init_db
+    setup_logging(log_level)
+    init_db()
     n = process_once(batch=batch)
     typer.echo(f"Processed {n} actions")
 
@@ -48,7 +33,8 @@ def drain(batch: int = 64,
 def smoke(symbol: str = "XAUUSD", side: str = "SELL", volume: float = 0.01,
           log_level: str = typer.Option("INFO", "--log-level", "-l")):
     """Enqueue an OPEN+CLOSE smoke test."""
-    config = initialize_cli_tool(log_level)  # Replaces setup_logging + init_db
+    setup_logging(log_level)
+    init_db()
     leg = Leg(leg_id="SMOKE#1", symbol=symbol, side=side.upper(), volume=volume, tag="SMOKE")
     open_action = Action(action_id="smoke-open", type="OPEN", legs=[leg], source_msg_id="SMOKE")
     close_action = Action(action_id="smoke-close", type="CLOSE", legs=[leg], source_msg_id="SMOKE")
@@ -61,11 +47,10 @@ def status(n: int = 10,
            actions_dir: str = typer.Option(None, help="Override MT5_ACTIONS_DIR"),
            log_level: str = typer.Option("INFO", "--log-level", "-l")):
     """Show queue/execution counts, leg totals, and last N actions."""
-    config = initialize_cli_tool(log_level)  # Replaces setup_logging + init_db
-    
-    # Use the config object instead of direct environment access
-    db_path = config.APP_DB_PATH
-    con = sqlite3.connect(db_path)
+    setup_logging(log_level)
+    init_db()
+    db = os.environ.get("APP_DB_PATH", "data/app.db")
+    con = sqlite3.connect(db)
 
     counts = dict(con.execute("SELECT status, COUNT(*) FROM queue GROUP BY status").fetchall())
     ex_count = con.execute("SELECT COUNT(*) FROM executions").fetchone()[0]
@@ -89,7 +74,7 @@ def status(n: int = 10,
         print(f"{d['type']}\tlegs={len(d['legs'])}\tid={d['action_id']}")
 
     if show_files:
-        adir = actions_dir or config.MT5_ACTIONS_DIR  # Use config instead of environ
+        adir = actions_dir or os.environ.get("MT5_ACTIONS_DIR") or os.path.join(os.getcwd(), "mt5_actions")
         try:
             files = [f for f in os.listdir(adir) if f.lower().endswith(".csv")]
             print(f"\nmt5_actions_dir: {adir}")
@@ -104,7 +89,9 @@ def preview(text: str,
             edit: bool = False,
             log_level: str = typer.Option("INFO", "--log-level", "-l")):
     """Preview how a message would parse & map to legs (no DB, no files)."""
-    config = initialize_cli_tool(log_level)  # Centralized initialization
+    setup_logging(log_level)
+    # no DB needed, but init is cheap/safe
+    init_db()
     acts = build_actions_from_message(
         source_msg_id="preview",
         text=text,
@@ -131,36 +118,6 @@ def preview(text: str,
         "type": a.type,
         "legs": rows
     }, indent=2))
-
-@app.command()
-def health():
-    """Check application health status."""
-    config = initialize_cli_tool("INFO")
-    
-    from app.common.app_init import get_app_health
-    health = get_app_health()
-    
-    print("🏥 Application Health Check")
-    print("=" * 40)
-    print(f"Overall Status: {'✅ Healthy' if health['healthy'] else '❌ Unhealthy'}")
-    
-    # Storage health
-    storage = health.get('storage', {})
-    print(f"Database:       {'✅ OK' if storage.get('healthy') else '❌ Issues'}")
-    if storage.get('db_path'):
-        print(f"  Path: {storage['db_path']}")
-    if storage.get('queue_counts'):
-        print(f"  Queue: {storage['queue_counts']}")
-    
-    # Config health  
-    cfg = health.get('config', {})
-    print(f"Configuration:  {'✅ OK' if all(cfg.values()) else '⚠️ Issues'}")
-    for key, value in cfg.items():
-        status = '✅' if value else '❌'
-        print(f"  {key}: {status}")
-    
-    if not health['healthy']:
-        raise typer.Exit(1)
 
 if __name__ == "__main__":
     app()
