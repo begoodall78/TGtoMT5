@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -52,6 +53,10 @@ LOGIN_CODE = os.environ.get("TG_LOGIN_CODE")
 # Defaults
 DEFAULT_LEG_VOLUME = float(os.environ.get("DEFAULT_LEG_VOLUME", "0.01"))
 DEFAULT_NUM_LEGS   = int(os.environ.get("DEFAULT_NUM_LEGS", "8"))
+
+# Global router instance (created lazily)
+_router_instance = None
+_router_lock = threading.Lock()
 
 # --- Helpers ------------------------------------------------------------------
 def _split_sources(srcs: str) -> list[str]:
@@ -180,6 +185,8 @@ def _echo_runtime_config():
         "MT5_FIRST_LEG_WORSE_PRICE": os.environ.get("MT5_FIRST_LEG_WORSE_PRICE"),
         "MT5_DEVIATION": os.environ.get("MT5_DEVIATION"),
         "MT5_FILLING": os.environ.get("MT5_FILLING"),
+        "POSITION_POLL_ENABLED": os.environ.get("POSITION_POLL_ENABLED", "false"),
+        "RISK_FREE_PIPS": os.environ.get("RISK_FREE_PIPS", "10.0"),
     }
 
     # Semantic dictionary metadata
@@ -215,6 +222,7 @@ def _echo_runtime_config():
         f"Session Dir/Name: {cfg['TG_SESSION_DIR']} / {cfg['TG_SESSION_NAME']}\n"
         f"Unparsed Fwd    : {cfg['UNPARSED_FORWARD_ENABLED']}  "
         f"(Review Chat: {cfg['UNPARSED_REVIEW_CHAT_ID']})\n"
+        f"Risk-Free       : Enabled={cfg['POSITION_POLL_ENABLED']} Pips={cfg['RISK_FREE_PIPS']}\n"
         "========================================================\n"
     )
     print(banner)
@@ -247,6 +255,46 @@ def _echo_runtime_config():
     except Exception:
         log.info("Ignore Rules   : disabled | version=NA | count=0")
 
+# Get router instance for risk-free processing (LAZY - FIXED)
+def get_router_for_processing():
+    """Get router instance lazily - only create when actually needed for RISK FREE messages."""
+    global _router_instance
+    
+    # Check if risk-free is even enabled
+    if os.getenv("POSITION_POLL_ENABLED", "false").lower() not in ("true", "1", "yes"):
+        return None
+    
+    # Use double-checked locking pattern
+    if _router_instance is not None:
+        return _router_instance
+    
+    with _router_lock:
+        # Check again inside the lock
+        if _router_instance is not None:
+            return _router_instance
+        
+        try:
+            # Only import and create when actually needed
+            from app.infra.mt5_router import Mt5NativeRouter
+            from app.common.config import Config
+            
+            # Run MT5 initialization in a separate thread to avoid blocking
+            def create_router():
+                return Mt5NativeRouter(Config())
+            
+            # Create in thread to avoid blocking event loop
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(create_router)
+                _router_instance = future.result(timeout=5.0)
+            
+            log.info("Router created for risk-free processing")
+            return _router_instance
+            
+        except Exception as e:
+            log.warning(f"Could not create router for risk-free: {e}")
+            return None
+
 # --- Main ingest loop ---------------------------------------------------------
 async def run_telegram_ingest():
     if API_ID == 0 or not API_HASH:
@@ -267,92 +315,123 @@ async def run_telegram_ingest():
             "resolved_count": (len(chat_filter) if isinstance(chat_filter, list) else ("ALL" if chat_filter is None else 1)),
         },
     )
+    
+    # Don't create router at startup - will be created lazily if needed
+    log.info("Risk-free support: %s", 
+             "enabled (router will be created on demand)" 
+             if os.getenv("POSITION_POLL_ENABLED", "false").lower() in ("true", "1", "yes")
+             else "disabled")
 
     @client.on(events.NewMessage(chats=chat_filter))
     async def on_new(event):
-        msg_id = str(event.id)
-        text = event.raw_text or ""
-        chat = await event.get_chat()
+        try:
+            msg_id = str(event.id)
+            text = event.raw_text or ""
+            chat = await event.get_chat()
+            
+            # Debug logging for reply detection
+            reply_to = getattr(event.message, "reply_to_msg_id", None)
+            if "risk free" in text.lower():
+                log.info(f"RISK FREE detected - reply_to_msg_id: {reply_to}, message: {event.message}")
+                if event.message.reply_to:
+                    log.info(f"Reply object exists: {event.message.reply_to}")
+        
+            # Only get router if this looks like a RISK FREE message
+            router = None
+            if re.search(r'\b(?:GOING\s+)?RISK\s*FREE\b', text, re.IGNORECASE):
+                router = get_router_for_processing()
 
-        actions = build_actions_from_message(
-            source_msg_id=msg_id,
-            text=text,
-            is_edit=False,
-            legs_count=DEFAULT_NUM_LEGS,
-            leg_volume=DEFAULT_LEG_VOLUME,
-            unparsed_reporter=reporter,
-            unparsed_raw_msg=event.message,
-            reply_to_msg_id=getattr(event.message, "reply_to_msg_id", None),
-        )
+            actions = build_actions_from_message(
+                source_msg_id=msg_id,
+                text=text,
+                is_edit=False,
+                legs_count=DEFAULT_NUM_LEGS,
+                leg_volume=DEFAULT_LEG_VOLUME,
+                unparsed_reporter=reporter,
+                unparsed_raw_msg=event.message,
+                reply_to_msg_id=getattr(event.message, "reply_to_msg_id", None),
+                router=router  # Pass router only when needed
+            )
 
-        if actions:
-            for a in actions:
-                dedup = not enqueue(a)
+            if actions:
+                for a in actions:
+                    dedup = not enqueue(a)
+                    log.info(
+                        "INGESTED_NEW",
+                        extra={
+                            "event": "INGESTED_DONE",
+                            "action_id": a.action_id,
+                            "dedup": dedup,
+                            "chat_id": getattr(chat, "id", None),
+                            "chat_title": getattr(chat, "title", None) or getattr(chat, "username", None),
+                        },
+                    )
+            else:
+                # If ignored explicitly, do not forward to unparsed
+                if getattr(event.message, "_ignored_by_gate", False):
+                    log.debug("Message ignored by gate", extra={"msg_id": msg_id})
+                else:
+                    await reporter.report_unparsed(event.message, reason="NO_MATCH")
                 log.info(
-                    "INGESTED_NEW",
+                    "UNPARSED_NEW_FORWARDED",
                     extra={
-                        "event": "INGESTED_DONE",
-                        "action_id": a.action_id,
-                        "dedup": dedup,
+                        "event": "UNPARSED_NEW_FORWARDED",
                         "chat_id": getattr(chat, "id", None),
-                        "chat_title": getattr(chat, "title", None) or getattr(chat, "username", None),
+                        "message_id": msg_id,
                     },
                 )
-        else:
-            # If ignored explicitly, do not forward to unparsed
-            if getattr(event.message, "_ignored_by_gate", False):
-                pass
-            else:
-                await reporter.report_unparsed(event.message, reason="NO_MATCH")
-            log.info(
-                "UNPARSED_NEW_FORWARDED",
-                extra={
-                    "event": "UNPARSED_NEW_FORWARDED",
-                    "chat_id": getattr(chat, "id", None),
-                    "message_id": msg_id,
-                },
-            )
+        except Exception as e:
+            log.error(f"Error processing new message: {e}", exc_info=True)
 
     @client.on(events.MessageEdited(chats=chat_filter))
     async def on_edit(event):
-        msg_id = str(event.id)
-        text = event.raw_text or ""
-        chat = await event.get_chat()
+        try:
+            msg_id = str(event.id)
+            text = event.raw_text or ""
+            chat = await event.get_chat()
+            
+            # Only get router if this looks like a RISK FREE message
+            router = None
+            if re.search(r'\b(?:GOING\s+)?RISK\s*FREE\b', text, re.IGNORECASE):
+                router = get_router_for_processing()
 
-        actions = build_actions_from_message(
-            source_msg_id=msg_id,
-            text=text,
-            is_edit=True,
-            legs_count=DEFAULT_NUM_LEGS,
-            leg_volume=DEFAULT_LEG_VOLUME,
-            unparsed_reporter=reporter,
-            unparsed_raw_msg=event.message,
-        )
+            actions = build_actions_from_message(
+                source_msg_id=msg_id,
+                text=text,
+                is_edit=True,
+                legs_count=DEFAULT_NUM_LEGS,
+                leg_volume=DEFAULT_LEG_VOLUME,
+                unparsed_reporter=reporter,
+                unparsed_raw_msg=event.message,
+                router=router  # Pass router only when needed
+            )
 
-        if actions:
-            for a in actions:
-                dedup = not enqueue(a)
+            if actions:
+                for a in actions:
+                    dedup = not enqueue(a)
+                    log.info(
+                        "INGESTED_EDIT",
+                        extra={
+                            "event": "INGESTED_EDIT",
+                            "action_id": a.action_id,
+                            "dedup": dedup,
+                            "chat_id": getattr(chat, "id", None),
+                            "chat_title": getattr(chat, "title", None) or getattr(chat, "username", None),
+                        },
+                    )
+            else:
+                # Forward/report non-parsed edit
+                await reporter.report_unparsed(event.message, reason="NO_MATCH")
                 log.info(
-                    "INGESTED_EDIT",
+                    "UNPARSED_EDIT_FORWARDED",
                     extra={
-                        "event": "INGESTED_EDIT",
-                        "action_id": a.action_id,
-                        "dedup": dedup,
+                        "event": "UNPARSED_EDIT_FORWARDED",
                         "chat_id": getattr(chat, "id", None),
-                        "chat_title": getattr(chat, "title", None) or getattr(chat, "username", None),
+                        "message_id": msg_id,
                     },
                 )
-        else:
-            # Forward/report non-parsed edit
-            await reporter.report_unparsed(event.message, reason="NO_MATCH")
-            log.info(
-                "UNPARSED_EDIT_FORWARDED",
-                extra={
-                    "event": "UNPARSED_EDIT_FORWARDED",
-                    "chat_id": getattr(chat, "id", None),
-                    "message_id": msg_id,
-                },
-            )
+        except Exception as e:
+            log.error(f"Error processing edited message: {e}", exc_info=True)
 
     await client.run_until_disconnected()
 

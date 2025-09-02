@@ -12,6 +12,17 @@ from typing import Any, Dict, List, Optional, Set
 from app.engine.semantic import load_semantic_dictionary, evaluate as sem_evaluate
 from app.refindex import record_open, generate_mock_ack_for_open, resolve_group_key, list_open_legs, update_leg_targets
 from .models import Action, Leg, Side
+
+# Import risk-free processing (will be created as a new file)
+# Import risk-free processing
+try:
+    from app.processing_risk_free import process_risk_free_message
+except ImportError as e:
+    print(f"ERROR: Cannot import processing_risk_free: {e}")
+    import traceback
+    traceback.print_exc()
+    process_risk_free_message = None
+    
 try:
     from .unparsed_reporter import UnparsedReporter
 except Exception:
@@ -888,13 +899,28 @@ MGMT_HANDLERS: dict[str, callable] = {
     'MGMT_RISK_FREE':  _handler_modify('MGMT_RISK_FREE'),
     'MGMT_TP2_HIT':    handle_tp2_hit,
 }
-def build_actions_from_message(source_msg_id: str, text: str, *, is_edit: bool=False, legs_count: int=5, leg_volume: float=DEFAULT_LEG_VOLUME, unparsed_reporter: Optional['UnparsedReporter']=None, unparsed_raw_msg: Optional[object]=None, reply_to_msg_id: Optional[str]=None) -> List[Action]:
-    """Parse a Telegram message and build one Action (OPEN/MODIFY) with 1..N legs."""
+def build_actions_from_message(source_msg_id: str, text: str, *, is_edit: bool=False, legs_count: int=5, leg_volume: float=DEFAULT_LEG_VOLUME, unparsed_reporter: Optional['UnparsedReporter']=None, unparsed_raw_msg: Optional[object]=None, reply_to_msg_id: Optional[str]=None, router=None) -> List[Action]:
+    """Parse a Telegram message and build one Action (OPEN/MODIFY) with 1..N legs.
+    
+    MODIFIED TO HANDLE GOING RISK FREE MESSAGES
+    """
+    
+    ps = parse_signal_text(text)
+    
+    # Check if this is a GOING RISK FREE message
+    if re.search(r'\b(?:GOING\s+)?RISK\s*FREE\b', text, re.IGNORECASE):
+        log.info(f"Detected RISK FREE message: {text[:100]}")
+        if process_risk_free_message:
+            action = process_risk_free_message(text, ps, source_msg_id, router, reply_to_msg_id)
+            #action = process_risk_free_message(text, ps, source_msg_id, router)  # Just pass ps through
+            return [action] if action else []
+        else:
+            log.warning("Risk-free processing not available - module not imported")
+       
     if _maybe_ack_ignore(source_msg_id, text, unparsed_raw_msg):
         return []
     _log_rules_state_once()
     legs_count = max(1, min(int(legs_count), MAX_LEGS))
-    ps = parse_signal_text(text)
     route = semantic_route(ps, text, reply_to_msg_id)
 
     # Validate range early for dual-price entries

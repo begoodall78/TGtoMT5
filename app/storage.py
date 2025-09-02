@@ -247,3 +247,242 @@ def get_storage_health() -> dict:
             "error": str(e),
             "db_path": db_manager.db_path
         }
+    
+# Add these functions to the end of your existing storage.py file:
+
+def update_filled_price(group_key: str, leg_tag: str, filled_price: float, 
+                        position_ticket: int = None) -> bool:
+    """
+    Update the filled price for a specific leg.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+        leg_tag: The leg identifier (e.g., "#1")
+        filled_price: The actual fill price from MT5
+        position_ticket: Optional position ticket number
+    
+    Returns:
+        True if updated successfully, False otherwise.
+    """
+    db_manager = get_db_manager()
+    
+    try:
+        db_manager.execute_one("""
+            UPDATE legs_index 
+            SET filled_price = ?,
+                entry_price = COALESCE(entry_price, ?),
+                position_ticket = COALESCE(?, position_ticket),
+                is_filled = 1,
+                filled_at = COALESCE(filled_at, datetime('now'))
+            WHERE group_key = ? AND leg_tag = ?
+        """, (filled_price, filled_price, position_ticket, group_key, leg_tag))
+        
+        log.debug(f"Updated filled price: group={group_key} leg={leg_tag} price={filled_price}")
+        return True
+        
+    except Exception as e:
+        log.error(f"Failed to update filled price: {e}", extra={
+            "group_key": group_key,
+            "leg_tag": leg_tag,
+            "error": str(e)
+        })
+        return False
+
+
+def get_filled_legs(group_key: str) -> List[dict]:
+    """
+    Get all filled legs for a message group.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+    
+    Returns:
+        List of dicts containing leg information.
+    """
+    db_manager = get_db_manager()
+    
+    try:
+        rows = db_manager.fetchall("""
+            SELECT 
+                leg_tag,
+                symbol,
+                side,
+                volume,
+                filled_price,
+                entry_price,
+                position_ticket,
+                order_ticket,
+                current_sl,
+                current_tp,
+                filled_at,
+                is_risk_free
+            FROM legs_index
+            WHERE group_key = ? AND is_filled = 1
+            ORDER BY leg_tag
+        """, (group_key,))
+        
+        return [
+            {
+                'leg_tag': row[0],
+                'symbol': row[1],
+                'side': row[2],
+                'volume': row[3],
+                'filled_price': row[4],
+                'entry_price': row[5],
+                'position_ticket': row[6],
+                'order_ticket': row[7],
+                'current_sl': row[8],
+                'current_tp': row[9],
+                'filled_at': row[10],
+                'is_risk_free': row[11]
+            }
+            for row in rows
+        ]
+        
+    except Exception as e:
+        log.error(f"Failed to get filled legs: {e}", extra={
+            "group_key": group_key,
+            "error": str(e)
+        })
+        return []
+
+
+def get_average_filled_price(group_key: str) -> Optional[float]:
+    """
+    Calculate the average filled price for all filled positions in a group.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+    
+    Returns:
+        Average filled price or None if no filled positions.
+    """
+    filled_legs = get_filled_legs(group_key)
+    
+    if not filled_legs:
+        return None
+    
+    # Calculate weighted average by volume
+    total_volume = 0.0
+    weighted_sum = 0.0
+    
+    for leg in filled_legs:
+        if leg['filled_price'] and leg['volume']:
+            volume = float(leg['volume'])
+            price = float(leg['filled_price'])
+            weighted_sum += price * volume
+            total_volume += volume
+    
+    if total_volume > 0:
+        return weighted_sum / total_volume
+    
+    return None
+
+
+def get_pending_legs(group_key: str) -> List[dict]:
+    """
+    Get all pending (unfilled) legs for a message group.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+    
+    Returns:
+        List of dicts containing leg information.
+    """
+    db_manager = get_db_manager()
+    
+    try:
+        rows = db_manager.fetchall("""
+            SELECT 
+                leg_tag,
+                symbol,
+                side,
+                volume,
+                order_ticket,
+                sl,
+                tp
+            FROM legs_index
+            WHERE group_key = ? 
+              AND is_filled = 0 
+              AND order_ticket IS NOT NULL
+            ORDER BY leg_tag
+        """, (group_key,))
+        
+        return [
+            {
+                'leg_tag': row[0],
+                'symbol': row[1],
+                'side': row[2],
+                'volume': row[3],
+                'order_ticket': row[4],
+                'sl': row[5],
+                'tp': row[6]
+            }
+            for row in rows
+        ]
+        
+    except Exception as e:
+        log.error(f"Failed to get pending legs: {e}", extra={
+            "group_key": group_key,
+            "error": str(e)
+        })
+        return []
+
+
+def mark_legs_risk_free(group_key: str) -> bool:
+    """
+    Mark all filled legs in a group as having gone risk-free.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+    
+    Returns:
+        True if successful, False otherwise.
+    """
+    db_manager = get_db_manager()
+    
+    try:
+        db_manager.execute_one("""
+            UPDATE legs_index 
+            SET is_risk_free = 1
+            WHERE group_key = ? AND is_filled = 1
+        """, (group_key,))
+        
+        log.info(f"Marked legs as risk-free: group={group_key}")
+        return True
+        
+    except Exception as e:
+        log.error(f"Failed to mark legs as risk-free: {e}", extra={
+            "group_key": group_key,
+            "error": str(e)
+        })
+        return False
+
+
+def is_group_risk_free(group_key: str) -> bool:
+    """
+    Check if a group has already gone risk-free.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+    
+    Returns:
+        True if any filled leg is marked as risk-free, False otherwise.
+    """
+    db_manager = get_db_manager()
+    
+    try:
+        result = db_manager.fetchone("""
+            SELECT COUNT(*) 
+            FROM legs_index 
+            WHERE group_key = ? AND is_risk_free = 1
+        """, (group_key,))
+        
+        return result[0] > 0 if result else False
+        
+    except Exception as e:
+        log.error(f"Failed to check risk-free status: {e}", extra={
+            "group_key": group_key,
+            "error": str(e)
+        })
+        return False

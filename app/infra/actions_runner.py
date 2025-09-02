@@ -12,6 +12,12 @@ from app import storage
 from app.infra.mt5_router import get_router
 from app.models import Action, RouterResult
 
+# Import position polling for risk-free management
+try:
+    from app.monitors.position_poller import start_position_polling
+except ImportError:
+    start_position_polling = None
+
 # Optional ticket persistence hooks
 try:
     from app import refindex  # type: ignore
@@ -409,8 +415,6 @@ def _execute_with_timeout(router, action, timeout_s: int):
         return fut.result(timeout=timeout_s)
 
 def run_forever(poll_seconds: float | None = None, batch: int = 32, idle_heartbeat_every: int = 60):
-
-
     # DB path & stale rescue
     db_path = storage.get_db_path()
     try:
@@ -430,6 +434,14 @@ def run_forever(poll_seconds: float | None = None, batch: int = 32, idle_heartbe
     _ensure_ticket_columns_once()
 
     router = get_router()
+    
+    # Start position polling if enabled (NEW FOR RISK-FREE)
+    if start_position_polling:
+        poller = start_position_polling(router)
+        if poller:
+            log.info("Position polling started for risk-free management")
+    else:
+        log.info("Position polling not available - risk-free features disabled")
 
     import sys as _sys, logging as _logging
     spinner = SpinnerUI(stdout=_sys.stdout, env=os.environ, idle_heartbeat_sec=idle_heartbeat_every)

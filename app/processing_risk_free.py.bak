@@ -1,0 +1,352 @@
+# app/processing_risk_free.py - FIXED VERSION
+"""
+Risk-free management for trades - handles GOING RISK FREE messages
+and generates appropriate MODIFY actions.
+
+FIXED: Gets actual fill prices directly from MT5 positions instead of database
+"""
+
+import logging
+import os
+import re
+from typing import Dict, List, Optional, Tuple
+
+from app.models import Action, Leg, ParseSignal
+from app.storage import (
+    get_filled_legs, 
+    get_average_filled_price,
+    get_pending_legs,
+    is_group_risk_free,
+    mark_legs_risk_free,
+    list_open_legs  # Import from refindex
+)
+
+log = logging.getLogger("processing.risk_free")
+
+
+def extract_group_reference(text: str, source_msg_id: str = None) -> Optional[str]:
+    """
+    Extract the group key reference from a GOING RISK FREE message.
+    
+    Patterns to match:
+    - "GOING RISK FREE 1234" -> OPEN_1234
+    - "GOING RISK FREE #1234" -> OPEN_1234
+    - "RISK FREE 1234" -> OPEN_1234
+    - If no number found, use source_msg_id as fallback
+    
+    Args:
+        text: The message text
+        source_msg_id: Fallback message ID if no reference found
+    
+    Returns:
+        Group key like "OPEN_1234" or None
+    """
+    # Try to find a message ID reference
+    patterns = [
+        r'(?:GOING\s+)?RISK\s*FREE\s+#?(\d+)',
+        r'RISK\s*FREE.*?(\d{3,})',  # At least 3 digits
+        r'#(\d+)',  # Just a hash reference
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            msg_id = match.group(1)
+            return f"OPEN_{msg_id}"
+    
+    # Fallback to source message ID if provided
+    if source_msg_id:
+        log.debug(f"No reference found in '{text}', using source_msg_id={source_msg_id}")
+        return f"OPEN_{source_msg_id}"
+    
+    return None
+
+
+def calculate_breakeven_price(symbol: str, side: str, entry_price: float, 
+                             pip_offset: float = 1.0) -> float:
+    """
+    Calculate breakeven + offset price for a position.
+    
+    Args:
+        symbol: Trading symbol (e.g., "XAUUSD")
+        side: "BUY" or "SELL"
+        entry_price: The entry/filled price
+        pip_offset: Pips above/below breakeven (default 1.0)
+    
+    Returns:
+        The new stop loss price
+    """
+    # Get pip value for symbol
+    pip_mult = get_pip_multiplier(symbol)
+    pip_value = pip_offset / pip_mult
+    
+    if side == "BUY":
+        # For BUY: breakeven + pips
+        return entry_price + pip_value
+    else:
+        # For SELL: breakeven - pips
+        return entry_price - pip_value
+
+
+def get_pip_multiplier(symbol: str) -> float:
+    """
+    Get pip multiplier for a symbol from environment or defaults.
+    
+    Args:
+        symbol: Trading symbol
+    
+    Returns:
+        Pip multiplier (e.g., 10 for XAUUSD, 10000 for EURUSD)
+    """
+    # Clean symbol (remove suffix like +)
+    clean_symbol = re.sub(r'[^A-Z0-9]', '', symbol.upper())
+    
+    # Check environment for override
+    env_key = f"PIP_MULT_{clean_symbol}"
+    if env_key in os.environ:
+        try:
+            return float(os.environ[env_key])
+        except ValueError:
+            pass
+    
+    # Default pip multipliers
+    defaults = {
+        'XAUUSD': 10.0,
+        'GOLD': 10.0,
+        'BTCUSD': 1.0,
+        'EURUSD': 10000.0,
+        'GBPUSD': 10000.0,
+        'USDJPY': 100.0,
+        'AUDUSD': 10000.0,
+        'NZDUSD': 10000.0,
+        'USDCAD': 10000.0,
+        'USDCHF': 10000.0,
+    }
+    
+    return defaults.get(clean_symbol, 10000.0)  # Default to forex
+
+
+def get_actual_fill_prices_from_mt5(group_key: str, router) -> Dict[str, dict]:
+    """
+    Get actual fill prices directly from MT5 positions.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+        router: MT5 router instance
+    
+    Returns:
+        Dict mapping leg_tag to position info including actual fill price
+    """
+    if not router or not router.mt5:
+        return {}
+    
+    # Extract message ID from group key
+    match = re.match(r'OPEN_(\d+)', group_key)
+    if not match:
+        return {}
+    
+    msg_id = match.group(1)
+    
+    # Get all positions from MT5
+    positions = router.mt5.positions_get()
+    if not positions:
+        return {}
+    
+    # Parse positions to find ones matching our message
+    filled_positions = {}
+    
+    for pos in positions:
+        # Check comment field for our message pattern
+        comment = getattr(pos, 'comment', '')
+        # Pattern: "msgid_legindex:symbol"
+        comment_match = re.match(r'^(\d+)_(\d+):(.+)$', comment)
+        
+        if comment_match and comment_match.group(1) == msg_id:
+            leg_idx = comment_match.group(2)
+            leg_tag = f"#{leg_idx}"
+            
+            filled_positions[leg_tag] = {
+                'position_ticket': pos.ticket,
+                'symbol': pos.symbol,
+                'side': 'BUY' if pos.type == 0 else 'SELL',  # 0=BUY, 1=SELL in MT5
+                'volume': pos.volume,
+                'filled_price': pos.price_open,  # ACTUAL fill price from MT5
+                'current_sl': pos.sl if pos.sl > 0 else None,
+                'current_tp': pos.tp if pos.tp > 0 else None,
+                'profit': pos.profit,
+                'comment': comment
+            }
+            
+            log.info(f"Found MT5 position: {leg_tag} filled at {pos.price_open:.2f} (ticket={pos.ticket})")
+    
+    return filled_positions
+
+
+def build_risk_free_action(group_key: str, ps: ParseSignal, 
+                          source_msg_id: str, router=None) -> Optional[Action]:
+    """
+    Build a MODIFY action to move positions to risk-free.
+    
+    This will:
+    1. Get actual fill prices from MT5 positions
+    2. Move SL to actual fill price + 1 pip for all filled positions
+    3. Keep TP unchanged
+    4. Mark the group as risk-free in database
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+        ps: ParseSignal (may be empty for GOING RISK FREE messages)
+        source_msg_id: Source message ID for the action
+        router: MT5 router to get actual positions
+    
+    Returns:
+        Action object or None if cannot build
+    """
+    # First try to get actual positions from MT5
+    mt5_positions = {}
+    if router and router.mt5:
+        mt5_positions = get_actual_fill_prices_from_mt5(group_key, router)
+        if mt5_positions:
+            log.info(f"Found {len(mt5_positions)} filled positions in MT5 for {group_key}")
+    
+    # If no MT5 positions found, fall back to database
+    if not mt5_positions:
+        log.warning(f"No MT5 positions found for {group_key}, checking database")
+        # Import here to avoid circular dependency
+        from app.refindex import list_open_legs
+        
+        legs_meta = list_open_legs(group_key) or []
+        if not legs_meta:
+            log.warning(f"No legs found in database for group {group_key}")
+            return None
+        
+        # Convert database format to our format
+        for meta in legs_meta:
+            if meta.get('position_ticket'):
+                leg_tag = meta.get('leg_tag') or meta.get('tag')
+                mt5_positions[leg_tag] = {
+                    'position_ticket': meta.get('position_ticket'),
+                    'symbol': meta.get('symbol'),
+                    'side': meta.get('side'),
+                    'volume': meta.get('volume'),
+                    'filled_price': meta.get('entry'),  # This is the problem - using planned entry, not actual fill
+                    'current_sl': meta.get('sl'),
+                    'current_tp': meta.get('tp')
+                }
+    
+    if not mt5_positions:
+        log.warning(f"No positions found for group {group_key}")
+        return None
+    
+    # Build MODIFY legs
+    modify_legs = []
+    be_offset = float(os.getenv("RISK_FREE_BE_OFFSET", "1.0"))
+    
+    for leg_tag, pos_data in mt5_positions.items():
+        # Use ACTUAL fill price from MT5
+        actual_fill_price = pos_data['filled_price']
+        if not actual_fill_price:
+            log.warning(f"No fill price for {leg_tag}, skipping")
+            continue
+        
+        # Calculate new SL based on ACTUAL fill price
+        new_sl = calculate_breakeven_price(
+            symbol=pos_data['symbol'],
+            side=pos_data['side'],
+            entry_price=actual_fill_price,  # Use actual fill price!
+            pip_offset=be_offset
+        )
+        
+        # Check if SL needs updating
+        current_sl = pos_data.get('current_sl', 0)
+        
+        # For BUY: only update if new SL is higher (better)
+        # For SELL: only update if new SL is lower (better)
+        should_update = False
+        if pos_data['side'] == 'BUY':
+            should_update = (current_sl == 0 or new_sl > current_sl)
+        else:
+            should_update = (current_sl == 0 or new_sl < current_sl)
+        
+        if should_update and pos_data.get('position_ticket'):
+            # Extract leg number from tag for leg_id
+            leg_num = re.search(r'#?(\d+)', leg_tag)
+            leg_num_str = leg_num.group(1) if leg_num else "1"
+            
+            leg = Leg(
+                leg_id=f"RF_{source_msg_id}#{leg_num_str}",
+                symbol=pos_data['symbol'],
+                side=pos_data['side'],
+                volume=pos_data['volume'],
+                sl=new_sl,
+                tp=pos_data.get('current_tp'),  # Keep existing TP
+                tag=leg_tag,
+                position_ticket=pos_data['position_ticket']
+            )
+            modify_legs.append(leg)
+            
+            log.info(
+                f"Risk-free SL for {leg_tag}: "
+                f"current={current_sl:.2f} -> new={new_sl:.2f} "
+                f"(actual_fill={actual_fill_price:.2f} + {be_offset} pips)"
+            )
+    
+    if not modify_legs:
+        log.warning(f"No positions need SL update for group {group_key}")
+        return None
+    
+    # Create the MODIFY action
+    action = Action(
+        action_id=f"RISK_FREE_{source_msg_id}_{group_key}",
+        type="MODIFY",
+        legs=modify_legs,
+        source_msg_id=source_msg_id,
+        metadata={
+            'group_key': group_key,
+            'risk_free': True,
+            'be_offset': be_offset
+        }
+    )
+    
+    # Mark group as risk-free in database
+    mark_legs_risk_free(group_key)
+    
+    return action
+
+
+def process_risk_free_message(text: str, ps: ParseSignal, 
+                             source_msg_id: str, router=None) -> Optional[Action]:
+    """
+    Main entry point for processing GOING RISK FREE messages.
+    
+    Args:
+        text: The message text
+        ps: ParseSignal object
+        source_msg_id: Message ID
+        router: MT5 router (REQUIRED for getting actual fill prices)
+    
+    Returns:
+        Action object or None
+    """
+    # Extract the group reference
+    group_key = extract_group_reference(text, source_msg_id)
+    if not group_key:
+        log.warning(f"Cannot extract group reference from: {text}")
+        return None
+    
+    log.info(f"Processing RISK FREE for group {group_key}")
+    
+    # Router is required to get actual fill prices
+    if not router:
+        log.error("Router not provided - cannot get actual fill prices from MT5")
+        return None
+    
+    # Build the risk-free action with actual MT5 fill prices
+    action = build_risk_free_action(group_key, ps, source_msg_id, router)
+    
+    if action:
+        log.info(f"Created RISK FREE action with {len(action.legs)} legs")
+    else:
+        log.warning(f"Could not create RISK FREE action for {group_key}")
+    
+    return action
