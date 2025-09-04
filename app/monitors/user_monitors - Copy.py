@@ -48,6 +48,20 @@ def _one_pip(mt5, symbol: str, env: Dict[str, str]) -> Optional[float]:
     except Exception:
         return None
 
+def _round_to_digits(mt5, symbol: str, price: float) -> float:
+    try:
+        info = mt5.symbol_info(symbol)
+        digits = int(getattr(info, "digits", 0) or 0)
+        return round(float(price), digits)
+    except Exception:
+        return float(price)
+
+def _leg_to_layer(leg: Optional[int]) -> Optional[int]:
+    """Map leg -> layer where each layer has 4 legs: 1-4->1, 5-8->2, 9-12->3, ..."""
+    if isinstance(leg, int) and leg >= 1:
+        return ((leg - 1) // 4) + 1
+    return None
+
 # ---- Base monitor interface ----
 
 class BaseMonitor:
@@ -198,7 +212,126 @@ class ManageTP2HitMonitor(BaseMonitor):
         return actions
 
 
+# ---- Manage Price Layers (NEW) ----
+
+class ManagePriceLayersMonitor(BaseMonitor):
+    """
+    When a higher price layer (groups of 4 legs) becomes active for a given message_id & side,
+    tighten TP on all *lower* layers' open positions to that position's own entry +/- 1 pip:
+      BUY  -> TP = price_open + pip
+      SELL -> TP = price_open - pip
+
+    Env:
+      PIP_MULT_<SYMBOL>=float       # pip override (e.g. PIP_MULT_XAUUSD+=10)
+      MON_DEBUG_LAYERS=1            # debug alerts
+      MON_LAYERS_TP_EPS_PIPS=0.05   # tolerance in pips before updating TP
+      MON_LAYERS_MIN_POS_IN_LAYER=1 # how many open positions constitute an "active" layer
+      MON_LAYERS_APPLY_TO_N_LOWER   # "all" (default) or integer N to only adjust the last N lower layers
+    """
+    name = "manage_price_layers"
+
+    @staticmethod
+    def _get_env_int(env: Dict[str, str], key: str, default: int) -> int:
+        try:
+            return int(str(env.get(key, default)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _get_env_float(env: Dict[str, str], key: str, default: float) -> float:
+        try:
+            return float(str(env.get(key, default)))
+        except Exception:
+            return default
+
+    def evaluate(self, positions, orders, ctx):
+        mt5 = ctx.get("mt5")
+        env = ctx.get("env", {})
+        debug = str(env.get("MON_DEBUG_LAYERS", "0")).lower() in ("1","true","yes","on")
+        min_pos_layer = self._get_env_int(env, "MON_LAYERS_MIN_POS_IN_LAYER", 1)
+        apply_to_n_lower_raw = str(env.get("MON_LAYERS_APPLY_TO_N_LOWER", "all")).strip().lower()
+        eps_pips = self._get_env_float(env, "MON_LAYERS_TP_EPS_PIPS", 0.05)
+
+        # Group positions by message_id
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for p in positions:
+            mid = p.get("message_id")
+            if mid:
+                groups.setdefault(mid, []).append(p)
+
+        actions: List[Action] = []
+
+        for mid, pos_list in groups.items():
+            # Split by side to avoid mixing BUY/SELL logic
+            sides = ("BUY", "SELL")
+            for side in sides:
+                side_pos = [p for p in pos_list if p.get("side") == side and _is_int_leg(p.get("leg"))]
+                if not side_pos:
+                    continue
+
+                # Build layer -> list of positions mapping
+                layers: Dict[int, List[Dict[str, Any]]] = {}
+                for p in side_pos:
+                    layer = _leg_to_layer(p.get("leg"))
+                    if layer is None:
+                        continue
+                    layers.setdefault(layer, []).append(p)
+
+                if not layers:
+                    continue
+
+                # Determine active layers (meeting min_pos_layer)
+                active_layers = sorted([L for L, plist in layers.items() if len(plist) >= min_pos_layer])
+                if not active_layers:
+                    continue
+                highest_layer = max(active_layers)
+
+                # Decide which lower layers to affect
+                if apply_to_n_lower_raw == "all":
+                    target_layers = [L for L in active_layers if L < highest_layer]
+                else:
+                    try:
+                        n = int(apply_to_n_lower_raw)
+                        min_layer = max(1, highest_layer - n)
+                        target_layers = [L for L in active_layers if min_layer <= L < highest_layer]
+                    except Exception:
+                        target_layers = [L for L in active_layers if L < highest_layer]
+
+                if not target_layers:
+                    if debug:
+                        actions.append(Alert(f"[{self.name}] msg={mid} side={side} highest_layer={highest_layer} no lower layers to adjust"))
+                    continue
+
+                # For each position in target lower layers: set TP to entry +/- 1 pip (per position), if meaningfully different
+                for layer in sorted(target_layers):
+                    for p in layers.get(layer, []):
+                        sym = p.get("symbol")
+                        pip = _one_pip(mt5, sym, env) if sym else None
+                        if not pip or pip <= 0:
+                            if debug:
+                                actions.append(Alert(f"[{self.name}] msg={mid} ticket={p.get('ticket')} no pip size for {sym}"))
+                            continue
+                        entry = float(p.get("price_open") or 0.0)
+                        target_tp = entry + pip if side == "BUY" else entry - pip
+                        target_tp = _round_to_digits(mt5, sym, target_tp)
+
+                        cur_tp = p.get("tp")
+                        # Only update if current TP is None or differs by more than eps*pip
+                        needs_update = (cur_tp is None) or (abs(float(cur_tp) - target_tp) > (eps_pips * pip))
+                        if needs_update:
+                            actions.append(ModifySLTP(ticket=int(p["ticket"]), tp=float(target_tp),
+                                                      reason=f"{self.name}: tighten TP to BE±1pip msg={mid} side={side} layer={layer}->{highest_layer}"))
+                        elif debug:
+                            actions.append(Alert(f"[{self.name}] msg={mid} ticket={p.get('ticket')} TP unchanged (cur={cur_tp} target={target_tp})"))
+
+                if debug:
+                    actions.append(Alert(f"[{self.name}] msg={mid} side={side} highest_layer={highest_layer} adjusted_layers={target_layers}"))
+
+        return actions
+
+
 # ---- Registry ----
 MONITORS: List[BaseMonitor] = [
     ManageTP2HitMonitor(),
+    ManagePriceLayersMonitor(),  # NEW
 ]

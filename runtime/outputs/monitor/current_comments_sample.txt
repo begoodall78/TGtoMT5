@@ -1,9 +1,20 @@
 == POSITIONS ==
-ticket=380003413 sym=XAUUSD+ comment="2530_2:XAUUSD" -> mid=2530 leg=2 sym_sfx=XAUUSD
-ticket=380003415 sym=XAUUSD+ comment="2530_3:XAUUSD" -> mid=2530 leg=3 sym_sfx=XAUUSD
-ticket=380003416 sym=XAUUSD+ comment="2530_4:XAUUSD" -> mid=2530 leg=4 sym_sfx=XAUUSD
+ticket=380309000 sym=XAUUSD+ comment="2539_1:XAUUSD" -> mid=2539 leg=1 sym_sfx=XAUUSD
+ticket=380309006 sym=XAUUSD+ comment="2539_2:XAUUSD" -> mid=2539 leg=2 sym_sfx=XAUUSD
+ticket=380309009 sym=XAUUSD+ comment="2539_3:XAUUSD" -> mid=2539 leg=3 sym_sfx=XAUUSD
+ticket=380309011 sym=XAUUSD+ comment="2539_4:XAUUSD" -> mid=2539 leg=4 sym_sfx=XAUUSD
 
 == ORDERS ==
-ticket=380021580 sym=XAUUSD+ comment="[sl 3483.53]" -> mid=None leg=None sym_sfx=None
-ticket=380021582 sym=XAUUSD+ comment="[sl 3483.53]" -> mid=None leg=None sym_sfx=None
-ticket=380021583 sym=XAUUSD+ comment="[sl 3483.53]" -> mid=None leg=None sym_sfx=None
+ticket=380310080 sym=XAUUSD+ comment="2539_5:XAUUSD" -> mid=2539 leg=5 sym_sfx=XAUUSD
+ticket=380310082 sym=XAUUSD+ comment="2539_6:XAUUSD" -> mid=2539 leg=6 sym_sfx=XAUUSD
+ticket=380310084 sym=XAUUSD+ comment="2539_7:XAUUSD" -> mid=2539 leg=7 sym_sfx=XAUUSD
+ticket=380310089 sym=XAUUSD+ comment="2539_8:XAUUSD" -> mid=2539 leg=8 sym_sfx=XAUUSD
+ticket=380310094 sym=XAUUSD+ comment="2539_9:XAUUSD" -> mid=2539 leg=9 sym_sfx=XAUUSD
+ticket=380310097 sym=XAUUSD+ comment="2539_10:XAUUSD" -> mid=2539 leg=10 sym_sfx=XAUUSD
+ticket=380310099 sym=XAUUSD+ comment="2539_11:XAUUSD" -> mid=2539 leg=11 sym_sfx=XAUUSD
+ticket=380310105 sym=XAUUSD+ comment="2539_12:XAUUSD" -> mid=2539 leg=12 sym_sfx=XAUUSD
+ticket=380310116 sym=XAUUSD+ comment="2539_13:XAUUSD" -> mid=2539 leg=13 sym_sfx=XAUUSD
+ticket=380310121 sym=XAUUSD+ comment="2539_14:XAUUSD" -> mid=2539 leg=14 sym_sfx=XAUUSD
+ticket=380310191 sym=XAUUSD+ comment="2539_15:XAUUSD" -> mid=2539 leg=15 sym_sfx=XAUUSD
+ticket=380310215 sym=XAUUSD+ comment="2539_16:XAUUSD" -> mid=2539 leg=16 sym_sfx=XAUUSD
+ticket=380312161 sym=XAUUSD+ comment="" -> mid=None leg=None sym_sfx=None

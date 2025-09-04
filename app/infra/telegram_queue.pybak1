@@ -31,34 +31,24 @@ def setup_console_unbuffered():
     if sys.platform == "win32":
         import io
         
-        # Force UTF-8 encoding for stdout/stderr
+        # Force unbuffered output
         try:
-            # Set UTF-8 mode for Python
-            sys.stdout.reconfigure(encoding='utf-8')
-            sys.stderr.reconfigure(encoding='utf-8')
-        except AttributeError:
-            # Fallback for older Python versions
             sys.stdout = io.TextIOWrapper(
-                sys.stdout.buffer,
-                encoding='utf-8',
-                errors='replace',  # Replace unhandled chars instead of crashing
-                line_buffering=False,
-                write_through=True
+                open(sys.stdout.fileno(), 'wb', 0), 
+                write_through=True,
+                line_buffering=False
             )
             sys.stderr = io.TextIOWrapper(
-                sys.stderr.buffer,
-                encoding='utf-8',
-                errors='replace',
-                line_buffering=False,
-                write_through=True
+                open(sys.stderr.fileno(), 'wb', 0), 
+                write_through=True,
+                line_buffering=False
             )
         except Exception as e:
-            log.warning(f"Could not set UTF-8 console: {e}")
+            log.warning(f"Could not set unbuffered console: {e}")
         
-        # Enable UTF-8 code page
+        # Try to enable UTF-8 code page (like actions_runner does)
         try:
-            import subprocess
-            subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
+            os.system("chcp 65001 > nul 2>&1")
         except:
             pass
         
@@ -84,7 +74,6 @@ def setup_console_unbuffered():
         except Exception as e:
             log.debug(f"Could not disable Quick Edit Mode: {e}")
 
-
 class ConsoleManager:
     """Manages console output to prevent blocking"""
     def __init__(self):
@@ -94,18 +83,9 @@ class ConsoleManager:
     def safe_log(self, logger, level, message, *args, **kwargs):
         """Log with explicit flush to prevent blocking"""
         try:
-            # Ensure message is safe for logging (strip or replace problematic chars)
-            if isinstance(message, str):
-                # Remove or replace emojis and other problematic Unicode
-                message = message.encode('utf-8', errors='replace').decode('utf-8', errors='replace')
-            
             # Format message if args provided (for % style formatting)
             if args:
-                try:
-                    message = message % args
-                except:
-                    # If formatting fails, just join as strings
-                    message = f"{message} {' '.join(str(a) for a in args)}"
+                message = message % args
             
             # Log normally
             getattr(logger, level)(message, **kwargs)
@@ -118,13 +98,9 @@ class ConsoleManager:
                 sys.stderr.flush()
                 self.message_count = 0
                 self.last_flush = now
-        except Exception as e:
-            # Last resort - print directly
-            try:
-                print(f"[{level.upper()}] {str(message)[:200]}", file=sys.stderr)
-            except:
-                pass  # Give up silently
-                
+        except Exception:
+            pass  # Ignore flush errors
+            
     async def periodic_flush(self):
         """Async task to periodically flush output buffers"""
         while True:
@@ -134,7 +110,7 @@ class ConsoleManager:
                 sys.stderr.flush()
             except:
                 pass
-            
+
 # Create global console manager
 console = ConsoleManager()
 
