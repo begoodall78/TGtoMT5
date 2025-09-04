@@ -75,8 +75,9 @@ class BaseMonitor:
 class ManageTP2HitMonitor(BaseMonitor):
     """
     For each message group:
-      1) Scan open positions (then pending orders) for the first TP > 0 on a TP2-like leg: 2,6,10,14,...
-      2) If current price has exceeded that TP (Bid >= TP for BUY; Ask <= TP for SELL):
+      1) Scan ALL open positions and pending orders for TP2-like legs (2,6,10,14,...)
+      2) Find the MAXIMUM TP value among all TP2 candidates with TP > 0
+      3) If current price has exceeded that maximum TP (Bid >= TP for BUY; Ask <= TP for SELL):
          a) Delete all pending orders in the same message group (default).
             To keep certain legs (e.g., 1 and 2), set env MON_TP2_KEEP_LEGS="1,2".
          b) For every open position in the group, set SL to entry +/- 1 pip (BUY: entry+pip, SELL: entry-pip),
@@ -88,20 +89,56 @@ class ManageTP2HitMonitor(BaseMonitor):
     """
     name = "manage_tp2_hit"
 
-    def _first_tp2_candidate(self, positions: List[Dict[str, Any]], orders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        pos_tp2 = [p for p in positions if _is_tp2_like_leg(p.get("leg"))]
-        pos_tp2.sort(key=lambda r: r.get("leg", 10**9))
-        for p in pos_tp2:
-            tp = p.get("tp")
-            if tp and float(tp) > 0:
-                return p
-        ord_tp2 = [o for o in orders if _is_tp2_like_leg(o.get("leg"))]
-        ord_tp2.sort(key=lambda r: r.get("leg", 10**9))
-        for o in ord_tp2:
-            tp = o.get("tp")
-            if tp and float(tp) > 0:
-                return o
-        return None
+    def _max_tp2_candidate(self, positions: List[Dict[str, Any]], orders: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Find the TP2 candidate with the MAXIMUM TP value (not the first one).
+        This prevents triggering on positions that have already been modified to BE+1pip.
+        """
+        # Collect all TP2-like candidates from positions and orders
+        all_tp2_candidates = []
+        
+        # Add TP2 positions with TP > 0
+        for p in positions:
+            if _is_tp2_like_leg(p.get("leg")):
+                tp = p.get("tp")
+                if tp and float(tp) > 0:
+                    all_tp2_candidates.append(p)
+        
+        # Add TP2 orders with TP > 0
+        for o in orders:
+            if _is_tp2_like_leg(o.get("leg")):
+                tp = o.get("tp")
+                if tp and float(tp) > 0:
+                    all_tp2_candidates.append(o)
+        
+        if not all_tp2_candidates:
+            return None
+        
+        # Find the candidate with the maximum TP value
+        # For BUY orders, we want the highest TP
+        # For SELL orders, we want the lowest TP (but still use max since we're looking for furthest from current price)
+        max_candidate = None
+        max_tp_distance = 0
+        
+        for candidate in all_tp2_candidates:
+            tp = float(candidate.get("tp", 0))
+            side = candidate.get("side")
+            
+            # For comparison, we need to consider the side
+            # BUY: higher TP is further from current price
+            # SELL: lower TP is further from current price
+            if side == "BUY":
+                tp_distance = tp  # Higher is further for BUY
+            elif side == "SELL":
+                tp_distance = -tp  # Lower (more negative) is further for SELL
+            else:
+                continue
+                
+            if max_candidate is None or tp_distance > max_tp_distance:
+                max_candidate = candidate
+                max_tp_distance = tp_distance
+        
+        return max_candidate
 
     def _price_exceeded(self, mt5, row: Dict[str, Any]) -> Tuple[bool, float, float]:
         sym = row.get("symbol")
@@ -163,7 +200,8 @@ class ManageTP2HitMonitor(BaseMonitor):
         actions: List[Action] = []
 
         for mid, grp in groups.items():
-            candidate = self._first_tp2_candidate(grp["positions"], grp["orders"])
+            # CHANGED: Use _max_tp2_candidate instead of _first_tp2_candidate
+            candidate = self._max_tp2_candidate(grp["positions"], grp["orders"])
             if not candidate:
                 if debug:
                     actions.append(Alert(f"[{self.name}] msg={mid} no TP2-like candidate with TP>0"))
@@ -174,7 +212,8 @@ class ManageTP2HitMonitor(BaseMonitor):
             exceeded, bid, ask = self._price_exceeded(mt5, candidate)
 
             if debug:
-                actions.append(Alert(f"[{self.name}] msg={mid} leg={leg} side={side} tp={tp} bid={bid} ask={ask} exceeded={exceeded}"))
+                # Enhanced debug to show it's using the maximum TP
+                actions.append(Alert(f"[{self.name}] msg={mid} MAX TP2 leg={leg} side={side} tp={tp} bid={bid} ask={ask} exceeded={exceeded}"))
 
             if not exceeded:
                 continue

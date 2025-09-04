@@ -1,1 +1,38 @@
-[]
+[
+  {
+    "kind": "position",
+    "ticket": 382062032,
+    "symbol": "XAUUSD+",
+    "side": "BUY",
+    "volume": 0.01,
+    "price_open": 3557.3,
+    "sl": 3560.0,
+    "tp": 3569.0,
+    "price_current": 3567.83,
+    "profit": 7.83,
+    "comment": "1622_3:XAUUSD",
+    "message_id": "1622",
+    "leg": 3,
+    "comment_sym_suffix": "XAUUSD",
+    "time": 1756922205,
+    "magic": 1
+  },
+  {
+    "kind": "position",
+    "ticket": 382062039,
+    "symbol": "XAUUSD+",
+    "side": "BUY",
+    "volume": 0.01,
+    "price_open": 3557.3,
+    "sl": 3560.0,
+    "tp": null,
+    "price_current": 3567.83,
+    "profit": 7.83,
+    "comment": "1622_4:XAUUSD",
+    "message_id": "1622",
+    "leg": 4,
+    "comment_sym_suffix": "XAUUSD",
+    "time": 1756922205,
+    "magic": 1
+  }
+]

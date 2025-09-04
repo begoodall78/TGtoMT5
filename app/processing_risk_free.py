@@ -19,6 +19,116 @@ else:
 
 log = logging.getLogger("processing.risk_free")
 
+def delete_pending_orders_for_group(group_key: str, router, source_msg_id: str) -> List[dict]:
+    """
+    Delete all pending orders for a group when going risk-free.
+    
+    Args:
+        group_key: The group identifier (e.g., "OPEN_1234")
+        router: MT5 router with mt5 connection
+        source_msg_id: Source message ID for logging
+    
+    Returns:
+        List of deletion results
+    """
+    import re
+    
+    # Extract message ID from group key
+    match = re.match(r'OPEN_(\d+)', group_key)
+    if not match:
+        log.error(f"Cannot extract message ID from group_key: {group_key}")
+        return []
+    
+    target_msg_id = match.group(1)
+    deletion_results = []
+    
+    if not router or not hasattr(router, 'mt5'):
+        log.error("No MT5 connection available for order deletion")
+        return []
+    
+    try:
+        # Get all pending orders
+        orders = router.mt5.orders_get()
+        if not orders:
+            log.info("No pending orders found")
+            return []
+        
+        orders_to_delete = []
+        
+        # Find orders matching this message ID
+        for order in orders:
+            comment = getattr(order, 'comment', '')
+            
+            # Parse comment: "msgid_legindex:symbol" or "msgid#legindex:symbol"
+            comment_match = re.match(r'^(\d+)[_#](\d+)(?::.*)?', comment)
+            
+            if comment_match:
+                msg_id = comment_match.group(1)
+                leg_idx = comment_match.group(2)
+                
+                if msg_id == target_msg_id:
+                    orders_to_delete.append({
+                        'ticket': order.ticket,
+                        'symbol': order.symbol,
+                        'comment': comment,
+                        'leg': leg_idx
+                    })
+                    log.info(f"Found pending order to delete: ticket={order.ticket} "
+                           f"leg={leg_idx} symbol={order.symbol}")
+        
+        # Delete each order
+        for order_info in orders_to_delete:
+            try:
+                request = {
+                    "action": router.mt5.TRADE_ACTION_REMOVE,
+                    "order": order_info['ticket'],
+                    "symbol": order_info['symbol'],
+                    "magic": getattr(router, 'magic', 99999),
+                    "comment": f"Risk free delete msg={target_msg_id}"
+                }
+                
+                result = router.mt5.order_send(request)
+                
+                if result and result.retcode == router.mt5.TRADE_RETCODE_DONE:
+                    deletion_results.append({
+                        'ticket': order_info['ticket'],
+                        'success': True,
+                        'leg': order_info['leg']
+                    })
+                    log.info(f"Successfully deleted order {order_info['ticket']} "
+                           f"(leg {order_info['leg']})")
+                else:
+                    error_msg = result.comment if result else "Unknown error"
+                    deletion_results.append({
+                        'ticket': order_info['ticket'],
+                        'success': False,
+                        'error': error_msg,
+                        'leg': order_info['leg']
+                    })
+                    log.error(f"Failed to delete order {order_info['ticket']}: {error_msg}")
+                    
+            except Exception as e:
+                deletion_results.append({
+                    'ticket': order_info['ticket'],
+                    'success': False,
+                    'error': str(e),
+                    'leg': order_info['leg']
+                })
+                log.error(f"Exception deleting order {order_info['ticket']}: {e}")
+        
+        # Summary logging
+        if deletion_results:
+            success_count = sum(1 for r in deletion_results if r['success'])
+            fail_count = sum(1 for r in deletion_results if not r['success'])
+            log.info(f"Order deletion complete for msg={target_msg_id}: "
+                   f"{success_count} succeeded, {fail_count} failed")
+        else:
+            log.info(f"No pending orders found for msg={target_msg_id}")
+            
+    except Exception as e:
+        log.error(f"Error in delete_pending_orders_for_group: {e}", exc_info=True)
+    
+    return deletion_results
 
 def get_pip_multiplier(symbol: str) -> float:
     """Get pip multiplier for a symbol."""
@@ -66,7 +176,9 @@ def calculate_breakeven_price(symbol: str, side: str, entry_price: float,
 def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) -> Optional[Action]:
     """
     Build a MODIFY action to move positions to risk-free.
-    Gets actual fill prices from MT5 positions.
+    ENHANCED: Also deletes pending orders for the same message.
+    
+    Gets actual fill prices from MT5 positions and deletes pending orders.
     """
     log.info(f"Building risk-free action for {group_key}")
     
@@ -79,7 +191,18 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
     target_msg_id = match.group(1)
     log.info(f"Looking for positions from message {target_msg_id}")
     
-    # Get positions from MT5 if router is available
+    # STEP 1: Delete pending orders FIRST (before modifying positions)
+    if router:
+        log.info("Deleting pending orders before setting risk-free SL")
+        deletion_results = delete_pending_orders_for_group(group_key, router, source_msg_id)
+        
+        if deletion_results:
+            success_count = sum(1 for r in deletion_results if r['success'])
+            log.info(f"Deleted {success_count} pending orders for risk-free")
+    else:
+        log.warning("No router available - cannot delete pending orders")
+    
+    # STEP 2: Get positions and calculate SL (your existing code)
     filled_positions = {}
     
     if router and hasattr(router, 'mt5'):
@@ -110,68 +233,36 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
                                 'symbol': pos.symbol,
                                 'side': 'BUY' if pos.type == 0 else 'SELL',
                                 'volume': pos.volume,
-                                'filled_price': pos.price_open,  # ACTUAL fill price
+                                'filled_price': pos.price_open,
                                 'current_sl': pos.sl if pos.sl > 0 else None,
-                                'current_tp': pos.tp if pos.tp > 0 else None,
+                                'current_tp': pos.tp if pos.tp > 0 else None
                             }
                             
-                            log.info(f"FOUND MT5 POSITION: {leg_tag} ticket={pos.ticket} "
-                                   f"filled_at={pos.price_open:.2f} current_sl={pos.sl:.2f}")
+                            log.info(f"Found position for leg {leg_tag}: ticket={pos.ticket} "
+                                   f"fill={pos.price_open:.2f}")
                             
         except Exception as e:
             log.error(f"Error getting MT5 positions: {e}", exc_info=True)
-    else:
-        log.warning("No router available for MT5 positions")
     
-    # If no MT5 positions found, try database as fallback
+    # Fallback to database if no MT5 positions
     if not filled_positions:
-        log.info("No MT5 positions found, checking database")
-        
+        log.info("Checking database for positions")
         try:
             from app.refindex import list_open_legs
             legs_meta = list_open_legs(group_key) or []
-            log.info(f"Database returned {len(legs_meta)} legs")
             
             for meta in legs_meta:
                 if meta.get('position_ticket'):
                     leg_tag = meta.get('leg_tag') or meta.get('tag')
-                    
-                    # Try to get actual position from MT5 using ticket
-                    if router and hasattr(router, 'mt5'):
-                        try:
-                            pos_ticket = meta.get('position_ticket')
-                            positions = router.mt5.positions_get(ticket=pos_ticket)
-                            if positions and len(positions) > 0:
-                                pos = positions[0]
-                                filled_positions[leg_tag] = {
-                                    'position_ticket': pos.ticket,
-                                    'symbol': pos.symbol,
-                                    'side': 'BUY' if pos.type == 0 else 'SELL',
-                                    'volume': pos.volume,
-                                    'filled_price': pos.price_open,  # ACTUAL from MT5
-                                    'current_sl': pos.sl if pos.sl > 0 else None,
-                                    'current_tp': pos.tp if pos.tp > 0 else None,
-                                }
-                                log.info(f"Got position from MT5 by ticket: {leg_tag} "
-                                       f"ticket={pos.ticket} filled_at={pos.price_open:.2f}")
-                                continue
-                        except:
-                            pass
-                    
-                    # Last resort - use database entry
                     filled_positions[leg_tag] = {
                         'position_ticket': meta.get('position_ticket'),
                         'symbol': meta.get('symbol'),
                         'side': meta.get('side'),
                         'volume': meta.get('volume'),
-                        'filled_price': meta.get('entry'),  # WARNING: planned entry, not actual
+                        'filled_price': meta.get('entry'),
                         'current_sl': meta.get('sl'),
                         'current_tp': meta.get('tp')
                     }
-                    
-                    log.warning(f"Using DATABASE entry for {leg_tag}: {meta.get('entry'):.2f} "
-                              f"(NOT ACTUAL FILL PRICE!)")
-                    
         except Exception as e:
             log.error(f"Error getting database legs: {e}", exc_info=True)
     
@@ -212,7 +303,7 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
     new_sl = calculate_breakeven_price(
         symbol=symbol,
         side=side,
-        entry_price=weighted_avg_price,  # Use weighted average
+        entry_price=weighted_avg_price,
         pip_offset=be_offset
     )
     
@@ -269,7 +360,6 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
     )
     
     return action
-
 
 def process_risk_free_message(text: str, ps, source_msg_id: str, router=None, reply_to_msg_id: str = None) -> Optional[Action]:
     """

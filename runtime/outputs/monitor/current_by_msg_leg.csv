@@ -1,1 +1,5 @@
 message_id,leg,positions_count,orders_count,pos_volume,ord_volume,pos_profit,symbols
+1622,3,1,0,0.01,0.00,7.83,XAUUSD+
+1622,4,1,0,0.01,0.00,7.83,XAUUSD+
+92,15,0,1,0.00,0.01,0.00,XAUUSD+
+92,16,0,1,0.00,0.01,0.00,XAUUSD+

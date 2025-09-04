@@ -221,11 +221,12 @@ rules:
       # Phrases that users actually write
       - field: text.norm
         contains_any:
-          - "break even"
-          - "risk free"
-          - "breakeven"
-          - "move to be"
-          - "move 2 be"
+          - "not used"
+          #- "break even"
+          #- "risk free"
+          #- "breakeven"
+          #- "move to be"
+          #- "move 2 be"
       # Single-word BE (safe because we require a reply/quote)
       - field: text.norm
         contains_word_any: ["be"]
