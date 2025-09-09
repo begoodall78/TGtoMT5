@@ -368,9 +368,239 @@ class ManagePriceLayersMonitor(BaseMonitor):
 
         return actions
 
+class TrailStopByTPLevelsMonitor(BaseMonitor):
+    """
+    Trail stop-loss based on TP levels from the database.
+    For each message group with open positions:
+      1. Query the database for TP1, TP2, TP3 from legs_index table
+      2. Check current market price
+      3. Adjust SL based on price position relative to TP levels:
+         - Price > TP1: SL = BE + 1 pip <==== CURRENTLY TURNED OFF
+         - Price > TP2: SL = TP1
+         - Price > TP3: SL = TP2
+    
+    Env:
+      MON_DEBUG_TRAIL=1         # debug alerts
+      MON_TRAIL_ENABLED=1       # enable/disable monitor
+    """
+    name = "trail_stop_by_tp"
 
+    def _get_tp_levels_from_db(self, message_id: str) -> Dict[int, float]:
+        """
+        Query the database for TP levels of the first 3 legs of a message.
+        Returns dict: {1: tp1_value, 2: tp2_value, 3: tp3_value}
+        """
+        from app.common.database import get_db_manager
+        
+        try:
+            db_manager = get_db_manager()
+            
+            # Build the group_key from message_id (format: OPEN_{message_id})
+            group_key = f"OPEN_{message_id}"
+            
+            # Query for legs 1, 2, 3 - leg_tag format is like "XAUUSD#1", "XAUUSD#2", etc.
+            rows = db_manager.fetchall("""
+                SELECT leg_tag, tp 
+                FROM legs_index 
+                WHERE group_key = ? 
+                AND (leg_tag LIKE '%#1' OR leg_tag LIKE '%#2' OR leg_tag LIKE '%#3')
+                ORDER BY leg_tag
+            """, (group_key,))
+            
+            tp_levels = {}
+            for leg_tag, tp in rows:
+                if tp and float(tp) > 0:
+                    # Extract leg number from leg_tag (e.g., "XAUUSD#1" -> 1)
+                    import re
+                    match = re.search(r'#(\d+)$', leg_tag)
+                    if match:
+                        leg_num = int(match.group(1))
+                        if leg_num in [1, 2, 3]:
+                            tp_levels[leg_num] = float(tp)
+            
+            return tp_levels
+            
+        except Exception as e:
+            if hasattr(self, 'debug') and self.debug:
+                print(f"[{self.name}] Error fetching TP levels for msg={message_id}: {e}")
+            return {}
+
+    def _get_current_price(self, mt5, symbol: str, side: str) -> float:
+        """Get current market price (Bid for BUY, Ask for SELL)."""
+        try:
+            tick = mt5.symbol_info_tick(symbol)
+            if side == "BUY":
+                return float(getattr(tick, "bid", 0.0) or 0.0)
+            elif side == "SELL":
+                return float(getattr(tick, "ask", 0.0) or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _determine_new_sl(self, position: Dict[str, Any], tp_levels: Dict[int, float], 
+                         current_price: float, pip: float, mt5) -> Optional[float]:
+        """
+        Determine the new SL based on current price position relative to TP levels.
+        Returns None if no change needed.
+        """
+        side = position.get("side")
+        entry = float(position.get("price_open") or 0.0)
+        current_sl = position.get("sl")
+        symbol = position.get("symbol")
+        
+        if not side or not entry or not tp_levels:
+            return None
+        
+        # Get TP values (ensure they exist)
+        tp1 = tp_levels.get(1, 0)
+        tp2 = tp_levels.get(2, 0)
+        tp3 = tp_levels.get(3, 0)
+        
+        # Calculate breakeven + 1 pip
+        be_plus_1 = entry + pip if side == "BUY" else entry - pip
+        
+        # Determine target SL based on price position
+        target_sl = None
+        
+        if side == "BUY":
+            # For BUY positions: price moves up through TPs
+            if tp3 > 0 and current_price >= tp3:
+                target_sl = tp2  # Price > TP3: SL = TP2
+            elif tp2 > 0 and current_price >= tp2:
+                target_sl = tp1  # Price > TP2: SL = TP1
+            # elif tp1 > 0 and current_price >= tp1:
+            #    target_sl = be_plus_1  # Price > TP1: SL = BE + 1 pip
+                
+        elif side == "SELL":
+            # For SELL positions: price moves down through TPs
+            if tp3 > 0 and current_price <= tp3:
+                target_sl = tp2  # Price < TP3: SL = TP2
+            elif tp2 > 0 and current_price <= tp2:
+                target_sl = tp1  # Price < TP2: SL = TP1
+            #elif tp1 > 0 and current_price <= tp1:
+            #    target_sl = be_plus_1  # Price < TP1: SL = BE - 1 pip
+        
+        if target_sl is None:
+            return None
+            
+        # Round to symbol's digits
+        target_sl = _round_to_digits(mt5, symbol, target_sl)
+        
+        # Only update if it improves protection (don't move SL against position)
+        if self._improved_sl(side, current_sl, target_sl):
+            return target_sl
+            
+        return None
+
+    def _improved_sl(self, side: str, current_sl: Optional[float], target_sl: float) -> bool:
+        """Check if target SL is an improvement over current SL."""
+        if target_sl is None:
+            return False
+        if current_sl in (None, 0):
+            return True
+        if side == "BUY":
+            return float(target_sl) > float(current_sl)
+        elif side == "SELL":
+            return float(target_sl) < float(current_sl)
+        return False
+
+    def evaluate(self, positions, orders, ctx):
+        mt5 = ctx.get("mt5")
+        env = ctx.get("env", {})
+        
+        # Check if monitor is enabled
+        enabled = str(env.get("MON_TRAIL_ENABLED", "1")).lower() in ("1", "true", "yes", "on")
+        if not enabled:
+            return []
+            
+        self.debug = str(env.get("MON_DEBUG_TRAIL", "0")).lower() in ("1", "true", "yes", "on")
+        
+        # Group positions by message_id
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for p in positions:
+            mid = p.get("message_id")
+            if mid:
+                groups.setdefault(mid, []).append(p)
+        
+        actions: List[Action] = []
+        
+        for mid, pos_list in groups.items():
+            # Get TP levels from database
+            tp_levels = self._get_tp_levels_from_db(mid)
+            
+            if not tp_levels:
+                if self.debug:
+                    actions.append(Alert(f"[{self.name}] msg={mid} no TP levels in database"))
+                continue
+                
+            if self.debug:
+                tp_str = ", ".join([f"TP{k}={v:.5f}" for k, v in sorted(tp_levels.items())])
+                actions.append(Alert(f"[{self.name}] msg={mid} found TPs: {tp_str}"))
+            
+            # Process each position in the group
+            for p in pos_list:
+                symbol = p.get("symbol")
+                side = p.get("side")
+                
+                if not symbol or not side:
+                    continue
+                
+                # Get pip value
+                pip = _one_pip(mt5, symbol, env)
+                if not pip or pip <= 0:
+                    if self.debug:
+                        actions.append(Alert(f"[{self.name}] msg={mid} ticket={p.get('ticket')} no pip size for {symbol}"))
+                    continue
+                
+                # Get current market price
+                current_price = self._get_current_price(mt5, symbol, side)
+                if current_price <= 0:
+                    continue
+                
+                # Determine if SL needs adjustment
+                new_sl = self._determine_new_sl(p, tp_levels, current_price, pip, mt5)
+                
+                if new_sl is not None:
+                    ticket = int(p["ticket"])
+                    current_sl = p.get("sl")
+                    
+                    # Format current_sl safely - handle None values
+                    current_sl_str = f"{current_sl:.5f}" if current_sl is not None else "None"
+                    
+                    # Determine which TP level we're trailing to
+                    level_desc = ""
+                    entry = float(p.get("price_open") or 0.0)
+                    be_plus_1 = entry + pip if side == "BUY" else entry - pip
+                    
+                    if abs(new_sl - be_plus_1) < pip * 0.1:
+                        level_desc = "BE+1pip"
+                    elif abs(new_sl - tp_levels.get(1, 0)) < pip * 0.1:
+                        level_desc = "TP1"
+                    elif abs(new_sl - tp_levels.get(2, 0)) < pip * 0.1:
+                        level_desc = "TP2"
+                    
+                    actions.append(ModifySLTP(
+                        ticket=ticket, 
+                        sl=float(new_sl),
+                        reason=f"{self.name}: trail to {level_desc} msg={mid} (was {current_sl_str})"
+                    ))
+                    
+                    if self.debug:
+                        actions.append(Alert(
+                            f"[{self.name}] msg={mid} ticket={ticket} {side} "
+                            f"price={current_price:.5f} SL: {current_sl_str} -> {new_sl:.5f} ({level_desc})"
+                        ))
+                elif self.debug:
+                    current_sl_str = f"{p.get('sl')}" if p.get('sl') is not None else "None"
+                    actions.append(Alert(
+                        f"[{self.name}] msg={mid} ticket={p.get('ticket')} SL unchanged (current={current_sl_str})"
+                    ))
+        
+        return actions
+    
 # ---- Registry ----
 MONITORS: List[BaseMonitor] = [
     ManageTP2HitMonitor(),
-    ManagePriceLayersMonitor(),  # NEW
+    ManagePriceLayersMonitor(),
+    TrailStopByTPLevelsMonitor(),  # NEW - Add this line
 ]

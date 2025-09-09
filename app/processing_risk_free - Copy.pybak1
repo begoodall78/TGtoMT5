@@ -1,11 +1,7 @@
-# app/processing_risk_free.py - ENHANCED VERSION
+# app/processing_risk_free.py - FINAL VERSION
 """
 Risk-free management for trades - handles GOING RISK FREE messages.
 Only uses the quoted/replied-to message ID, ignores any numbers in the text.
-
-Supports two modes:
-1. WEIGHTED_AVERAGE: All positions get same SL based on weighted average entry
-2. INDIVIDUAL_ENTRY: Each position gets SL at its own entry + offset
 """
 
 import logging
@@ -170,9 +166,9 @@ def calculate_breakeven_price(symbol: str, side: str, entry_price: float,
     else:
         new_sl = entry_price - pip_value
     
-    log.info(f"Calculated SL: symbol={symbol} side={side} entry={entry_price:.5f} "
+    log.info(f"Calculated SL: symbol={symbol} side={side} entry={entry_price:.2f} "
              f"offset={pip_offset} pips, pip_value={pip_value:.5f}, "
-             f"new_sl={new_sl:.5f}")
+             f"new_sl={new_sl:.2f}")
     
     return new_sl
 
@@ -183,16 +179,8 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
     ENHANCED: Also deletes pending orders for the same message.
     
     Gets actual fill prices from MT5 positions and deletes pending orders.
-    
-    Two modes controlled by RISK_FREE_MODE environment variable:
-    - WEIGHTED_AVERAGE (default): All positions get same SL based on weighted average
-    - INDIVIDUAL_ENTRY: Each position gets SL at its own entry + offset
     """
     log.info(f"Building risk-free action for {group_key}")
-    
-    # Get the mode from environment variable
-    risk_free_mode = os.getenv("RISK_FREE_MODE", "WEIGHTED_AVERAGE").upper()
-    log.info(f"Using risk-free mode: {risk_free_mode}")
     
     # Extract message ID from group key
     match = re.match(r'OPEN_(\d+)', group_key)
@@ -214,7 +202,7 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
     else:
         log.warning("No router available - cannot delete pending orders")
     
-    # STEP 2: Get positions and calculate SL
+    # STEP 2: Get positions and calculate SL (your existing code)
     filled_positions = {}
     
     if router and hasattr(router, 'mt5'):
@@ -251,7 +239,7 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
                             }
                             
                             log.info(f"Found position for leg {leg_tag}: ticket={pos.ticket} "
-                                   f"fill={pos.price_open:.5f}")
+                                   f"fill={pos.price_open:.2f}")
                             
         except Exception as e:
             log.error(f"Error getting MT5 positions: {e}", exc_info=True)
@@ -284,136 +272,84 @@ def build_risk_free_action(group_key: str, ps, source_msg_id: str, router=None) 
     
     log.info(f"Processing {len(filled_positions)} positions for risk-free")
     
-    # Get BE offset from environment
-    be_offset = float(os.getenv("RISK_FREE_BE_OFFSET", "1.0"))
+    # Calculate weighted average fill price
+    total_volume = 0.0
+    weighted_sum = 0.0
+    symbol = None
+    side = None
     
-    # Build MODIFY legs based on mode
+    for leg_tag, pos_data in filled_positions.items():
+        if pos_data['filled_price'] and pos_data['volume']:
+            price = float(pos_data['filled_price'])
+            volume = float(pos_data['volume'])
+            weighted_sum += price * volume
+            total_volume += volume
+            
+            # Get symbol and side from first position
+            if not symbol:
+                symbol = pos_data['symbol']
+                side = pos_data['side']
+    
+    if total_volume == 0:
+        log.error("No valid volumes found for weighted average")
+        return None
+    
+    weighted_avg_price = weighted_sum / total_volume
+    log.info(f"Weighted average fill price: {weighted_avg_price:.2f} "
+             f"(total volume: {total_volume:.2f})")
+    
+    # Calculate single SL based on weighted average
+    be_offset = float(os.getenv("RISK_FREE_BE_OFFSET", "1.0"))
+    new_sl = calculate_breakeven_price(
+        symbol=symbol,
+        side=side,
+        entry_price=weighted_avg_price,
+        pip_offset=be_offset
+    )
+    
+    log.info(f"Single SL for all positions: {new_sl:.2f} "
+             f"(weighted avg {weighted_avg_price:.2f} + {be_offset} pips)")
+    
+    # Build MODIFY legs with the same SL for all
     modify_legs = []
     
-    if risk_free_mode == "INDIVIDUAL_ENTRY":
-        # INDIVIDUAL MODE: Each position gets its own SL at entry + offset
-        log.info(f"INDIVIDUAL_ENTRY mode: Setting individual SLs for each position")
+    for leg_tag, pos_data in filled_positions.items():
+        if not pos_data.get('position_ticket'):
+            continue
+            
+        current_sl = pos_data.get('current_sl', 0) or 0
         
-        for leg_tag, pos_data in filled_positions.items():
-            if not pos_data.get('position_ticket'):
-                continue
+        # Check if update needed
+        should_update = False
+        if side == 'BUY':
+            should_update = (current_sl == 0 or new_sl > current_sl)
+        else:
+            should_update = (current_sl == 0 or new_sl < current_sl)
+        
+        if should_update:
+            leg_num = re.search(r'#?(\d+)', leg_tag)
+            leg_num_str = leg_num.group(1) if leg_num else "1"
             
-            if not pos_data.get('filled_price'):
-                log.warning(f"No fill price for {leg_tag}, skipping")
-                continue
-            
-            # Calculate individual SL for this position
-            individual_sl = calculate_breakeven_price(
+            leg = Leg(
+                leg_id=f"RF_{source_msg_id}#{leg_num_str}",
                 symbol=pos_data['symbol'],
-                side=pos_data['side'],
-                entry_price=float(pos_data['filled_price']),
-                pip_offset=be_offset
+                side=pos_data['side'] or 'BUY',
+                volume=pos_data['volume'] or 0.01,
+                sl=new_sl,  # Same SL for all positions
+                tp=pos_data.get('current_tp'),
+                tag=leg_tag,
+                position_ticket=pos_data['position_ticket']
             )
+            modify_legs.append(leg)
             
-            current_sl = pos_data.get('current_sl', 0) or 0
-            
-            # Check if update needed
-            should_update = False
-            if pos_data['side'] == 'BUY':
-                should_update = (current_sl == 0 or individual_sl > current_sl)
-            else:
-                should_update = (current_sl == 0 or individual_sl < current_sl)
-            
-            if should_update:
-                leg_num = re.search(r'#?(\d+)', leg_tag)
-                leg_num_str = leg_num.group(1) if leg_num else "1"
-                
-                leg = Leg(
-                    leg_id=f"RF_{source_msg_id}#{leg_num_str}",
-                    symbol=pos_data['symbol'],
-                    side=pos_data['side'] or 'BUY',
-                    volume=pos_data['volume'] or 0.01,
-                    sl=individual_sl,  # Individual SL for this position
-                    tp=pos_data.get('current_tp'),
-                    tag=leg_tag,
-                    position_ticket=pos_data['position_ticket']
-                )
-                modify_legs.append(leg)
-                
-                log.info(f"MODIFY (Individual): {leg_tag} ticket={pos_data['position_ticket']} "
-                       f"entry={pos_data['filled_price']:.5f} → SL={individual_sl:.5f}")
-    
-    else:  # WEIGHTED_AVERAGE mode (default)
-        # Calculate weighted average fill price
-        total_volume = 0.0
-        weighted_sum = 0.0
-        symbol = None
-        side = None
-        
-        for leg_tag, pos_data in filled_positions.items():
-            if pos_data['filled_price'] and pos_data['volume']:
-                price = float(pos_data['filled_price'])
-                volume = float(pos_data['volume'])
-                weighted_sum += price * volume
-                total_volume += volume
-                
-                # Get symbol and side from first position
-                if not symbol:
-                    symbol = pos_data['symbol']
-                    side = pos_data['side']
-        
-        if total_volume == 0:
-            log.error("No valid volumes found for weighted average")
-            return None
-        
-        weighted_avg_price = weighted_sum / total_volume
-        log.info(f"Weighted average fill price: {weighted_avg_price:.5f} "
-                 f"(total volume: {total_volume:.2f})")
-        
-        # Calculate single SL based on weighted average
-        new_sl = calculate_breakeven_price(
-            symbol=symbol,
-            side=side,
-            entry_price=weighted_avg_price,
-            pip_offset=be_offset
-        )
-        
-        log.info(f"Single SL for all positions: {new_sl:.5f} "
-                 f"(weighted avg {weighted_avg_price:.5f} + {be_offset} pips)")
-        
-        # Apply same SL to all positions
-        for leg_tag, pos_data in filled_positions.items():
-            if not pos_data.get('position_ticket'):
-                continue
-                
-            current_sl = pos_data.get('current_sl', 0) or 0
-            
-            # Check if update needed
-            should_update = False
-            if side == 'BUY':
-                should_update = (current_sl == 0 or new_sl > current_sl)
-            else:
-                should_update = (current_sl == 0 or new_sl < current_sl)
-            
-            if should_update:
-                leg_num = re.search(r'#?(\d+)', leg_tag)
-                leg_num_str = leg_num.group(1) if leg_num else "1"
-                
-                leg = Leg(
-                    leg_id=f"RF_{source_msg_id}#{leg_num_str}",
-                    symbol=pos_data['symbol'],
-                    side=pos_data['side'] or 'BUY',
-                    volume=pos_data['volume'] or 0.01,
-                    sl=new_sl,  # Same SL for all positions
-                    tp=pos_data.get('current_tp'),
-                    tag=leg_tag,
-                    position_ticket=pos_data['position_ticket']
-                )
-                modify_legs.append(leg)
-                
-                log.info(f"MODIFY (Weighted): {leg_tag} ticket={pos_data['position_ticket']} "
-                       f"SL={new_sl:.5f} (from weighted avg)")
+            log.info(f"MODIFY: {leg_tag} ticket={pos_data['position_ticket']} "
+                   f"SL={new_sl:.2f} (from weighted avg)")
     
     if not modify_legs:
         log.warning(f"No positions need SL update")
         return None
     
-    log.info(f"Creating MODIFY action with {len(modify_legs)} legs using {risk_free_mode} mode")
+    log.info(f"Creating MODIFY action with {len(modify_legs)} legs")
     
     # Create the MODIFY action
     action = Action(
@@ -430,10 +366,6 @@ def process_risk_free_message(text: str, ps, source_msg_id: str, router=None, re
     Main entry point for processing GOING RISK FREE messages.
     
     IMPORTANT: Only uses the replied-to message ID, ignores any numbers in the text.
-    
-    Modes (set via RISK_FREE_MODE environment variable):
-    - WEIGHTED_AVERAGE (default): All positions get same SL based on weighted average
-    - INDIVIDUAL_ENTRY: Each position gets SL at its own entry + offset
     
     Args:
         text: The message text (ignored for parsing numbers)
@@ -459,10 +391,9 @@ def process_risk_free_message(text: str, ps, source_msg_id: str, router=None, re
     action = build_risk_free_action(group_key, ps, source_msg_id, router)
     
     if action:
-        mode = os.getenv("RISK_FREE_MODE", "WEIGHTED_AVERAGE").upper()
-        log.info(f"Created RISK FREE action with {len(action.legs)} legs using {mode} mode")
+        log.info(f"Created RISK FREE action with {len(action.legs)} legs")
         for leg in action.legs:
-            log.info(f"  Leg: {leg.tag} sl={leg.sl:.5f}")
+            log.info(f"  Leg: {leg.tag} sl={leg.sl:.2f}")
     else:
         log.error(f"Failed to create RISK FREE action for {group_key}")
     

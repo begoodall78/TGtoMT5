@@ -6,8 +6,6 @@ import logging
 import os
 import re
 import time
-import queue
-import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
@@ -22,91 +20,6 @@ from .user_monitors import MONITORS
 
 app = typer.Typer(no_args_is_help=True)
 log = logging.getLogger("mt5_account_monitor")
-
-# === Non-Blocking Console Output Handler ===
-class NonBlockingConsole:
-    """Thread-safe non-blocking console output to prevent Windows console selection blocking."""
-    def __init__(self, max_queue_size=1000):
-        self.q = queue.Queue(maxsize=max_queue_size)
-        self.thread = threading.Thread(target=self._worker, daemon=True, name="ConsoleWriter")
-        self.running = True
-        self.thread.start()
-    
-    def _worker(self):
-        while self.running:
-            try:
-                msg = self.q.get(timeout=0.1)
-                if msg is not None:  # None is our shutdown signal
-                    try:
-                        print(msg, flush=True)
-                    except Exception:
-                        pass  # Ignore print errors
-            except queue.Empty:
-                continue
-    
-    def write(self, msg):
-        """Non-blocking write. Drops message if queue is full."""
-        try:
-            self.q.put_nowait(msg)
-        except queue.Full:
-            # Queue is full, drop the message
-            pass
-    
-    def shutdown(self):
-        """Graceful shutdown."""
-        self.running = False
-        try:
-            self.q.put_nowait(None)
-        except:
-            pass
-        self.thread.join(timeout=1)
-
-# Initialize global console writer
-_console_writer = None
-
-def get_console_writer():
-    global _console_writer
-    if _console_writer is None:
-        _console_writer = NonBlockingConsole()
-    return _console_writer
-
-# === Loop Watchdog ===
-class LoopWatchdog:
-    """Monitor main loop health and detect hangs."""
-    def __init__(self, timeout=10, name="MainLoop"):
-        self.last_tick = time.time()
-        self.timeout = timeout
-        self.name = name
-        self.running = True
-        self.hang_count = 0
-        self.thread = threading.Thread(target=self._monitor, daemon=True, name=f"Watchdog-{name}")
-        self.thread.start()
-    
-    def tick(self):
-        """Update last activity timestamp."""
-        self.last_tick = time.time()
-        if self.hang_count > 0:
-            log.info(f"WATCHDOG: {self.name} recovered after {self.hang_count} hang detection(s)")
-            self.hang_count = 0
-    
-    def _monitor(self):
-        while self.running:
-            time.sleep(1)
-            elapsed = time.time() - self.last_tick
-            if elapsed > self.timeout:
-                self.hang_count += 1
-                log.error(f"WATCHDOG: {self.name} appears stuck! Last tick: {elapsed:.1f} seconds ago (hang #{self.hang_count})")
-                # Also try to write to console in case logging is blocked
-                try:
-                    console = get_console_writer()
-                    console.write(f"[WARNING] Loop appears stuck for {elapsed:.1f} seconds!")
-                except:
-                    pass
-    
-    def shutdown(self):
-        """Graceful shutdown."""
-        self.running = False
-        self.thread.join(timeout=1)
 
 @dataclass
 class MonitorConfig:
@@ -421,15 +334,14 @@ def _render_msg_grouped_console_lines(idx: Dict[Tuple[str, int], Dict[str, Any]]
     return lines
 
 def _emit_console_lines(lines: List[str], plain: bool = True) -> None:
-    """Write each line using non-blocking console writer."""
+    """Write each line either via print([HH:MM:SS] ...) or logger, to avoid JSON escaping."""
     if not lines:
         return
-    console = get_console_writer()
     if plain:
         ts = time.strftime("%H:%M:%S", time.localtime())
         for line in lines:
             try:
-                console.write(f"[{ts}] {line}")
+                print(f"[{ts}] {line}")
             except Exception:
                 log.info(line)
     else:
@@ -573,8 +485,7 @@ def run(log_level: str = typer.Option("INFO", "--log-level", "-l"),
         interval_sec: float = typer.Option(None, "--interval"),
         plain_console: bool = typer.Option(True, "--plain-console/--no-plain-console", help="Bypass JSON logger and print with time only"),
         apply_actions: bool = typer.Option(False, "--apply-actions/--dry-run", help="Actually execute planned actions"),
-        show_grouped: bool = typer.Option(True, "--grouped/--no-grouped", help="Show grouped-by-message breakdown in console"),
-        watchdog_timeout: int = typer.Option(10, "--watchdog-timeout", help="Seconds before watchdog alerts on stuck loop")):
+        show_grouped: bool = typer.Option(True, "--grouped/--no-grouped", help="Show grouped-by-message breakdown in console")):
     """Run the MT5 account monitor (summarises positions & pending orders on each tick)."""
     setup_logging(log_level)
     cfg = Config()
@@ -589,16 +500,6 @@ def run(log_level: str = typer.Option("INFO", "--log-level", "-l"),
         plain_console = os.environ.get("MONITOR_PLAIN_CONSOLE", "1").lower() in ("1","true","yes","on")
     if os.environ.get("MONITOR_SHOW_GROUPED") is not None:
         show_grouped = os.environ.get("MONITOR_SHOW_GROUPED", "1").lower() in ("1","true","yes","on")
-    # watchdog timeout from env
-    if os.environ.get("MONITOR_WATCHDOG_TIMEOUT") is not None:
-        try:
-            watchdog_timeout = int(os.environ.get("MONITOR_WATCHDOG_TIMEOUT"))
-        except:
-            pass
-
-    # Initialize non-blocking console and watchdog
-    console = get_console_writer()
-    watchdog = LoopWatchdog(timeout=watchdog_timeout, name="MT5Monitor")
 
     # Force native backend; connect via router (reuses env/Config/mt5 setup)
     os.environ.setdefault("ROUTER_BACKEND", "native")
@@ -611,93 +512,76 @@ def run(log_level: str = typer.Option("INFO", "--log-level", "-l"),
     except Exception:
         pass
 
-    log.info("MONITOR_STARTED | heartbeat=%s interval=%.3fs filter=%s out=%s watchdog=%ds", 
-             hb, iv, sym_filter, base_dir, watchdog_timeout)
+    log.info("MONITOR_STARTED | heartbeat=%s interval=%.3fs filter=%s out=%s", hb, iv, sym_filter, base_dir)
 
     last_tick_time: Optional[int] = None
     last_log_time: float = 0.0  # for throttling log prints
 
-    try:
-        while True:
-            # Update watchdog at start of each loop iteration
-            watchdog.tick()
-            
-            # Wait for next tick (or fallback to interval sleep)
-            new_t = _next_tick(mt5, hb, last_tick_time)
-            if new_t is None:
-                time.sleep(iv)
-                continue
-            last_tick_time = new_t
+    while True:
+        # Wait for next tick (or fallback to interval sleep)
+        new_t = _next_tick(mt5, hb, last_tick_time)
+        if new_t is None:
+            time.sleep(iv)
+            continue
+        last_tick_time = new_t
 
-            positions = _summarise_positions(mt5, sym_filter)
-            orders = _summarise_orders(mt5, sym_filter)
-            aggregate = _aggregate_summary(positions + orders)
+        positions = _summarise_positions(mt5, sym_filter)
+        orders = _summarise_orders(mt5, sym_filter)
+        aggregate = _aggregate_summary(positions + orders)
 
-            # message_id/leg breakdown
-            msg_leg_idx = _group_by_msg_leg(positions, orders)
-            _write_msg_leg_outputs(base_dir, msg_leg_idx)
-            _debug_dump_comments(base_dir, positions, orders, msg_leg_idx)
+        # message_id/leg breakdown
+        msg_leg_idx = _group_by_msg_leg(positions, orders)
+        _write_msg_leg_outputs(base_dir, msg_leg_idx)
+        _debug_dump_comments(base_dir, positions, orders, msg_leg_idx)
 
-            _write_outputs(base_dir, positions, orders, aggregate, write_json=True, write_csv=True)
+        _write_outputs(base_dir, positions, orders, aggregate, write_json=True, write_csv=True)
 
-            # === Evaluate user monitors -> build an actions plan ===
-            env_map = {k: v for k, v in os.environ.items() if k.startswith("MON_") or k.startswith("MONITOR_")}
-            ctx = {
-                "now_ts": int(time.time()),
-                "env": env_map,
-                "router": router,
-                "mt5": mt5,
-            }
-            planned_actions: List[Action] = []
-            for mon in MONITORS:
-                try:
-                    acts = mon.evaluate(positions, orders, ctx) or []
-                    planned_actions.extend(acts)
-                except Exception as e:
-                    # don't crash the loop on monitor error
-                    planned_actions.append(Alert(f"[monitor_error] {getattr(mon, 'name', mon.__class__.__name__)}: {e}"))
+        # === Evaluate user monitors -> build an actions plan ===
+        env_map = {k: v for k, v in os.environ.items() if k.startswith("MON_") or k.startswith("MONITOR_")}
+        ctx = {
+            "now_ts": int(time.time()),
+            "env": env_map,
+            "router": router,
+            "mt5": mt5,
+        }
+        planned_actions: List[Action] = []
+        for mon in MONITORS:
+            try:
+                acts = mon.evaluate(positions, orders, ctx) or []
+                planned_actions.extend(acts)
+            except Exception as e:
+                # don't crash the loop on monitor error
+                planned_actions.append(Alert(f"[monitor_error] {getattr(mon, 'name', mon.__class__.__name__)}: {e}"))
 
-            # Write actions plan snapshots
-            actions_dir = base_dir
-            with open(os.path.join(actions_dir, "current_actions_plan.json"), "w", encoding="utf-8") as f:
-                json.dump([a.to_dict() for a in planned_actions], f, ensure_ascii=False, indent=2)
-            with open(os.path.join(actions_dir, "current_actions_plan.txt"), "w", encoding="utf-8") as f:
-                for a in planned_actions:
-                    f.write(str(a.to_dict()) + "\n")
+        # Write actions plan snapshots
+        actions_dir = base_dir
+        with open(os.path.join(actions_dir, "current_actions_plan.json"), "w", encoding="utf-8") as f:
+            json.dump([a.to_dict() for a in planned_actions], f, ensure_ascii=False, indent=2)
+        with open(os.path.join(actions_dir, "current_actions_plan.txt"), "w", encoding="utf-8") as f:
+            for a in planned_actions:
+                f.write(str(a.to_dict()) + "\n")
 
-            # Optionally execute
-            exec_results = execute_actions(mt5, router, planned_actions, apply=bool(apply_actions))
-            with open(os.path.join(actions_dir, "current_actions_exec.json"), "w", encoding="utf-8") as f:
-                json.dump([{"ok": r.ok, "action": r.action.to_dict(), "details": r.details} for r in exec_results], f, ensure_ascii=False, indent=2)
+        # Optionally execute
+        exec_results = execute_actions(mt5, router, planned_actions, apply=bool(apply_actions))
+        with open(os.path.join(actions_dir, "current_actions_exec.json"), "w", encoding="utf-8") as f:
+            json.dump([{"ok": r.ok, "action": r.action.to_dict(), "details": r.details} for r in exec_results], f, ensure_ascii=False, indent=2)
 
-            # Show actions summary immediately after execution
-            _emit_console_lines(_format_actions_console(planned_actions, exec_results, bool(apply_actions)), plain_console)
+        # Show actions summary immediately after execution
+        _emit_console_lines(_format_actions_console(planned_actions, exec_results, bool(apply_actions)), plain_console)
 
-            # Human one-liner for logs + grouped console view (every 5 seconds)
-            now = time.time()
-            if now - last_log_time >= 5:
-                total_pos = sum(v["positions"]["count"] for v in aggregate.values())
-                total_ord = sum(v["orders"]["count"] for v in aggregate.values())
-                pnl = sum(v["positions"]["profit"] for v in aggregate.values())
-                _emit_console_line(f"SNAPSHOT | pos={total_pos} ord={total_ord} pnl={pnl:.2f} symbols={len(aggregate)}", plain_console)
+        # Human one-liner for logs + grouped console view (every 5 seconds)
+        now = time.time()
+        if now - last_log_time >= 5:
+            total_pos = sum(v["positions"]["count"] for v in aggregate.values())
+            total_ord = sum(v["orders"]["count"] for v in aggregate.values())
+            pnl = sum(v["positions"]["profit"] for v in aggregate.values())
+            _emit_console_line(f"SNAPSHOT | pos={total_pos} ord={total_ord} pnl={pnl:.2f} symbols={len(aggregate)}", plain_console)
 
-                if show_grouped:
-                    lines = _render_msg_grouped_console_lines(msg_leg_idx, max_messages=int(os.environ.get("MONITOR_GROUPED_MAX", "8")))
-                    _emit_console_lines(lines, plain_console)
+            if show_grouped:
+                lines = _render_msg_grouped_console_lines(msg_leg_idx, max_messages=int(os.environ.get("MONITOR_GROUPED_MAX", "8")))
+                _emit_console_lines(lines, plain_console)
 
-                last_log_time = now
-    
-    except KeyboardInterrupt:
-        log.info("Monitor interrupted by user")
-        console.write("[INFO] Shutting down monitor...")
-    except Exception as e:
-        log.error(f"Monitor crashed: {e}", exc_info=True)
-        raise
-    finally:
-        # Cleanup
-        log.info("Shutting down monitor components...")
-        watchdog.shutdown()
-        console.shutdown()
+            last_log_time = now
 
 
 if __name__ == "__main__":

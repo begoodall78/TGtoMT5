@@ -1,3 +1,1 @@
 kind,ticket,symbol,side,volume,price_open,sl,tp,price_current,profit,comment,message_id,leg,comment_sym_suffix,time,magic
-position,382062032,XAUUSD+,BUY,0.01,3557.3,3560.0,3569.0,3567.83,7.83,1622_3:XAUUSD,1622,3,XAUUSD,1756922205,1
-position,382062039,XAUUSD+,BUY,0.01,3557.3,3560.0,,3567.83,7.83,1622_4:XAUUSD,1622,4,XAUUSD,1756922205,1

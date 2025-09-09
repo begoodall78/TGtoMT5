@@ -1,21 +1,4 @@
 {
-  "ts": 1756917762,
-  "symbols": [
-    {
-      "symbol": "XAUUSD+",
-      "positions": {
-        "count": 2,
-        "buy": 2,
-        "sell": 0,
-        "vol": 0.02,
-        "profit": 15.66
-      },
-      "orders": {
-        "count": 2,
-        "buy": 2,
-        "sell": 0,
-        "vol": 0.02
-      }
-    }
-  ]
+  "ts": 1757323296,
+  "symbols": []
 }
